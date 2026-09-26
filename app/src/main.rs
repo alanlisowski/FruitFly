@@ -1,75 +1,199 @@
 // Without this, Windows gives a GUI-less process a console window that flashes up on every launch.
 #![windows_subsystem = "windows"]
 
+mod fly;
+mod path;
+
+use fly::{Feet, FlyPose};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tiny_skia::Pixmap;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
+    SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
     PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
-    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_QUIT, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DPICHANGED, WM_QUIT,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
-/// Window is a fixed 160x160 px. Small on purpose: every frame pushes SIZE*SIZE pixels to the
-/// compositor, so a postage stamp costs almost nothing where a fullscreen overlay would not.
-const SIZE_PX: i32 = 160;
 const FRAME: Duration = Duration::from_micros(16_667); // ~60 Hz
 
-/// Builds the square's pixels as premultiplied BGRA, one u32 (0xAARRGGBB) per pixel.
-///
-/// Premultiplied = each colour channel is already multiplied by alpha/255. `UpdateLayeredWindow`
-/// with AC_SRC_ALPHA expects this; feed it straight alpha and the edge shows a dark halo.
-fn square_pixels() -> Vec<u32> {
-    let (half, feather) = (50.0_f32, 4.0_f32); // 100 px square, 4 px soft edge
-    let c = SIZE_PX as f32 / 2.0;
-    let mut px = Vec::with_capacity((SIZE_PX * SIZE_PX) as usize);
-    for y in 0..SIZE_PX {
-        for x in 0..SIZE_PX {
-            // Chebyshev distance from centre = distance to the square's edge, in "square" metric.
-            let m = (x as f32 + 0.5 - c).abs().max((y as f32 + 0.5 - c).abs());
-            // 1.0 inside, 0.0 outside, linear ramp across `feather` px centred on the edge.
-            let a = ((half + feather / 2.0 - m) / feather).clamp(0.0, 1.0);
-            let alpha = (a * 255.0).round() as u32;
-            // Pure red (255,0,0) premultiplied: R = 255 * a = alpha, G = B = 0.
-            px.push(alpha << 24 | alpha << 16);
-        }
-    }
-    px
-}
+/// Set by the window procedure when Windows says our monitor's scaling changed; the main loop
+/// notices and rebuilds the window-sized buffers. (A window procedure is a bare `extern fn`
+/// with no access to our locals, so a global flag is the simplest way to talk to the loop.)
+static DPI_CHANGED: AtomicBool = AtomicBool::new(false);
 
-/// Every window needs a window procedure. Ours has nothing to handle: we draw with
-/// `UpdateLayeredWindow`, so WM_PAINT never arrives, and quitting comes from the tray.
+/// Every window needs a window procedure. We draw with `UpdateLayeredWindow`, so WM_PAINT never
+/// arrives; quitting comes from the tray. The only message we care about is WM_DPICHANGED.
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_DPICHANGED {
+        DPI_CHANGED.store(true, Ordering::Relaxed);
+        return LRESULT(0);
+    }
     // SAFETY: forwards Windows' own arguments untouched to Windows' default handler.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// tiny-skia produces premultiplied RGBA bytes; a Windows DIB wants premultiplied BGRA.
+/// Same numbers, red and blue swapped. Skip this and the fly comes out blue-eyed and bluish.
+fn rgba_to_bgra(src: &[u8], dst: &mut [u8]) {
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+    }
+}
+
+/// The window's pixels: a `size` x `size` 32-bit top-down DIB section (a bitmap whose memory we
+/// can write directly) selected into a memory DC, plus a tiny-skia pixmap we draw into first.
+struct Canvas {
+    size: i32,
+    pixmap: Pixmap,
+    dc: HDC,
+    bmp: HBITMAP,
+    bits: *mut u8,
+}
+
+impl Canvas {
+    fn new(size: i32) -> Self {
+        // Negative biHeight = top-down (row 0 is the top), matching tiny-skia's row order.
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: `bmi` and `bits` outlive the call. On success Windows sets `bits` to
+        // size*size*4 bytes of pixel memory that lives until we `DeleteObject` the bitmap
+        // (in `Drop`), and we never touch it after that.
+        let (dc, bmp) = unsafe {
+            let dc = CreateCompatibleDC(None); // a memory DC to select the bitmap into
+            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            SelectObject(dc, bmp.into());
+            (dc, bmp)
+        };
+        Canvas {
+            size,
+            pixmap: Pixmap::new(size as u32, size as u32).unwrap(),
+            dc,
+            bmp,
+            bits: bits as *mut u8,
+        }
+    }
+
+    /// Draws `pose` and pushes it to the screen, moving and (if needed) resizing the window.
+    fn present(&mut self, hwnd: HWND, pose: &FlyPose, feet: &Feet, scale: f32) {
+        // Whole-pixel window position (floored); the fly's fractional part is drawn *inside*
+        // the pixmap. Rounding the window instead would make slow motion snap and shimmer.
+        let origin = (
+            pose.x.floor() as i32 - self.size / 2,
+            pose.y.floor() as i32 - self.size / 2,
+        );
+        fly::draw(pose, feet, scale, &mut self.pixmap, origin);
+
+        // SAFETY: `bits` points to size*size*4 bytes (see `new`), and `&mut self` means nothing
+        // else is touching them. Every pointer handed to UpdateLayeredWindow refers to a local
+        // that outlives the call; hwnd and dc are live.
+        unsafe {
+            let dib = std::slice::from_raw_parts_mut(self.bits, (self.size * self.size * 4) as usize);
+            rgba_to_bgra(self.pixmap.data(), dib);
+
+            // Use the bitmap's per-pixel alpha (AC_SRC_ALPHA, which expects premultiplied
+            // colour), with no extra global fade (255 = fully opaque overall).
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            // Draws the bitmap AND positions/sizes the window in one call (the only way to
+            // show a layered window's content; WM_PAINT is ignored for it). A failure here
+            // (e.g. while the session is locked) shouldn't kill the pet: skip this frame.
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                None,                                              // destination DC: the screen
+                Some(&POINT { x: origin.0, y: origin.1 }),         // window's top-left
+                Some(&SIZE { cx: self.size, cy: self.size }),      // window size
+                Some(self.dc),                                     // source bitmap
+                Some(&POINT { x: 0, y: 0 }),                       // from the bitmap's top-left
+                COLORREF(0),                                       // colour key: unused here
+                Some(&blend),
+                ULW_ALPHA,
+            );
+        }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        // SAFETY: we own both handles and nothing uses them afterwards. The bitmap can only
+        // be deleted once it is no longer selected into a DC, so delete the DC first.
+        unsafe {
+            let _ = DeleteDC(self.dc);
+            let _ = DeleteObject(self.bmp.into());
+        }
+    }
+}
+
+/// Display scale of the monitor the window is on: 1.0 at 100%, 1.5 at 150%, 2.0 at 200%.
+fn dpi_scale(hwnd: HWND) -> f32 {
+    // SAFETY: plain FFI getter on our own window. Returns 0 on failure; fall back to 96 (100%).
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    (if dpi == 0 { 96 } else { dpi }) as f32 / 96.0
+}
+
+/// Centre of the primary monitor in physical pixels (valid because we're DPI aware).
+fn screen_center() -> (f32, f32) {
+    // SAFETY: trivial FFI getters.
+    unsafe { (GetSystemMetrics(SM_CXSCREEN) as f32 / 2.0, GetSystemMetrics(SM_CYSCREEN) as f32 / 2.0) }
+}
+
+/// Converts the walker's logical-pixel output (96 dpi, relative to the route's centre) into a
+/// pose in physical screen pixels.
+fn to_pose(s: &path::Step, scale: f32, center: (f32, f32)) -> FlyPose {
+    FlyPose {
+        x: center.0 + s.x * scale,
+        y: center.1 + s.y * scale,
+        heading: s.heading,
+        speed: s.speed * scale,
+        gait_phase: s.gait_phase,
+    }
 }
 
 fn main() {
     // SAFETY: plain FFI call with a constant. Must be the FIRST thing we do, before any window
     // exists; otherwise Windows "virtualises" our coordinates on scaled displays (125%, 150%...)
     // and the window lands in the wrong place. PER_MONITOR_AWARE_V2 = we get real pixels and are
-    // told when the window crosses to a monitor with a different scale.
+    // told (WM_DPICHANGED) when the window crosses to a monitor with a different scale.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
         .expect("SetProcessDpiAwarenessContext");
 
     // Tray icon first: it's our only way out. tray-icon makes its own hidden window on this
     // thread, so it works as long as our loop below keeps dispatching messages.
+    let pause = MenuItem::new("Pause", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
+    menu.append(&pause).unwrap();
     menu.append(&quit).unwrap();
-    let icon = Icon::from_rgba([255, 0, 0, 255].repeat(32 * 32), 32, 32).unwrap();
+    let icon = Icon::from_rgba([0x57, 0x46, 0x2c, 255].repeat(32 * 32), 32, 32).unwrap();
     let _tray = TrayIconBuilder::new() // dropped at end of main => icon removed, no ghost icon
         .with_menu(Box::new(menu))
         .with_tooltip("flit")
@@ -78,7 +202,7 @@ fn main() {
         .unwrap();
 
     // SAFETY: every call below is Win32 FFI. Handles come from the calls that create them and
-    // are used only on this thread, while still alive (we never free them before exit).
+    // are used only on this thread, while still alive.
     let hwnd = unsafe {
         let hinstance = GetModuleHandleW(None).unwrap().into();
         let class = w!("flit");
@@ -100,8 +224,8 @@ fn main() {
             WS_POPUP, // no title bar, border or menu: the window is exactly our pixels
             0,
             0,
-            SIZE_PX,
-            SIZE_PX,
+            1,
+            1, // real size is set by UpdateLayeredWindow once we know the DPI
             None,
             None,
             Some(hinstance),
@@ -110,77 +234,23 @@ fn main() {
         .unwrap()
     };
 
-    // A 32-bit top-down DIB section: a bitmap whose pixel memory we can write directly.
-    // Negative biHeight = top-down (row 0 is the top), which is the order we generate.
-    let mut bits = std::ptr::null_mut();
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: SIZE_PX,
-            biHeight: -SIZE_PX,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    // SAFETY: `bmi` and `bits` outlive the call. On success Windows sets `bits` to
-    // SIZE_PX*SIZE_PX*4 bytes of pixel memory that lives as long as the bitmap (i.e. forever
-    // here; the OS frees GDI objects when we exit).
-    let mem_dc = unsafe {
-        let dc = CreateCompatibleDC(None); // a memory DC we can select the bitmap into
-        let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
-        SelectObject(dc, bmp.into());
-        dc
-    };
-    // SAFETY: `bits` points to SIZE_PX*SIZE_PX u32s (see above); nothing else touches it.
-    // The square never changes, so we fill it once and only move the window afterwards.
-    unsafe {
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (SIZE_PX * SIZE_PX) as usize);
-        dst.copy_from_slice(&square_pixels());
-    }
-
-    // Constant for every frame: use the per-pixel alpha in the bitmap (AC_SRC_ALPHA), with no
-    // extra global fade (255 = fully opaque overall).
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: AC_SRC_ALPHA as u8,
-    };
-    let size = SIZE { cx: SIZE_PX, cy: SIZE_PX };
-    // SAFETY: trivial FFI getters. Physical pixels, thanks to the DPI awareness set above.
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-
-    // Draws the bitmap AND positions the window in one call (this is the only way to show a
-    // layered window's content; WM_PAINT is ignored for it).
-    let draw_at = |x: i32, y: i32| {
-        // SAFETY: all pointers refer to locals that outlive the call; hwnd and mem_dc are live.
-        unsafe {
-            UpdateLayeredWindow(
-                hwnd,
-                None,                  // destination DC: default (the screen)
-                Some(&POINT { x, y }), // where the window's top-left goes
-                Some(&size),
-                Some(mem_dc),
-                Some(&POINT { x: 0, y: 0 }), // start at the bitmap's top-left
-                COLORREF(0),                 // colour key: unused with ULW_ALPHA
-                Some(&blend),
-                ULW_ALPHA,
-            )
-            .unwrap();
-        }
-    };
-    draw_at(0, 0);
+    let mut scale = dpi_scale(hwnd);
+    let mut center = screen_center();
+    let mut canvas = Canvas::new(fly::window_size(scale));
+    let mut walker = path::Walker::new();
+    let mut step = walker.step(0.0);
+    let mut pose = to_pose(&step, scale, center);
+    let mut feet = Feet::new(&pose, scale);
+    canvas.present(hwnd, &pose, &feet, scale);
     // SW_SHOWNOACTIVATE: show without activating. Plain SW_SHOW would steal focus.
     // SAFETY: hwnd is a live window we created.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 
     // Fixed-step loop: drain messages, render when a frame is due, otherwise sleep ~1 ms.
     // No WM_TIMER; the later 1 kHz brain tick slots in next to the render step.
-    let start = Instant::now();
-    let mut next_frame = start;
+    let mut paused = false;
+    let mut last = Instant::now();
+    let mut next_frame = last;
     let mut msg = Default::default();
     'main: loop {
         // SAFETY: `msg` is a valid MSG out-param; PeekMessage (non-blocking) fills it.
@@ -195,24 +265,57 @@ fn main() {
                 DispatchMessageW(&msg);
             }
         }
-        if MenuEvent::receiver().try_iter().any(|e| e.id == *quit.id()) {
-            break;
+        for e in MenuEvent::receiver().try_iter() {
+            if e.id == *quit.id() {
+                break 'main;
+            }
+            if e.id == *pause.id() {
+                paused = !paused;
+                pause.set_text(if paused { "Resume" } else { "Pause" });
+                last = Instant::now(); // don't count the paused time as one giant frame
+            }
+        }
+
+        // The fly is drawn at a physical size, so a new scale means a new window size and
+        // new buffers. (Redraw even when paused, or the resized window would be blank.)
+        let mut redraw = DPI_CHANGED.swap(false, Ordering::Relaxed);
+        if redraw {
+            scale = dpi_scale(hwnd);
+            center = screen_center();
+            canvas = Canvas::new(fly::window_size(scale));
+            pose = to_pose(&step, scale, center);
+            feet = Feet::new(&pose, scale); // feet are pinned in screen pixels: re-pin at the new scale
+        }
+
+        if paused {
+            // Nothing moves, so nothing to draw: check the tray a few times a second.
+            if redraw {
+                canvas.present(hwnd, &pose, &feet, scale);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
         }
 
         let now = Instant::now();
         if now >= next_frame {
-            // Drift in a 200 px-radius circle around screen centre, one lap per 20 s.
-            let t = start.elapsed().as_secs_f32() * std::f32::consts::TAU / 20.0;
-            draw_at(
-                sw / 2 + (200.0 * t.cos()) as i32 - SIZE_PX / 2,
-                sh / 2 + (200.0 * t.sin()) as i32 - SIZE_PX / 2,
-            );
+            // Motion is driven by real elapsed time, not by counting frames, so a dropped
+            // frame doesn't change the fly's speed. The cap stops one long stall (e.g. the
+            // tray menu is modal and blocks this loop while open) from teleporting it.
+            let dt = now.duration_since(last).as_secs_f32().min(0.1);
+            last = now;
+            step = walker.step(dt);
+            pose = to_pose(&step, scale, center);
+            feet.update(&pose, scale);
+            redraw = true;
             next_frame += FRAME;
             if next_frame < now {
-                next_frame = now + FRAME; // fell behind (e.g. laptop slept): don't burst to catch up
+                next_frame = now + FRAME; // fell behind: don't burst to catch up
             }
-        } else {
+        } else if !redraw {
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if redraw {
+            canvas.present(hwnd, &pose, &feet, scale);
         }
     }
     // SAFETY: hwnd is ours and still valid. Then `_tray` drops, removing the tray icon.
@@ -223,17 +326,12 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The alpha bug shows up visually, not as an error, so pin it: premultiplied means no
-    /// channel may exceed alpha; centre is solid red; corner is fully transparent.
+    /// Channel order is the silent bug: red must stay red. tiny-skia RGBA [R,G,B,A] in,
+    /// Windows BGRA out.
     #[test]
-    fn pixels_are_premultiplied() {
-        let px = square_pixels();
-        for p in &px {
-            let (a, r) = (p >> 24, (p >> 16) & 0xFF);
-            assert!(r <= a && p & 0xFFFF == 0);
-        }
-        assert_eq!(px[(80 * SIZE_PX + 80) as usize], 0xFF_FF_00_00);
-        assert_eq!(px[0], 0);
-        assert!(px.iter().any(|p| (1..255).contains(&(p >> 24)))); // there IS a soft edge
+    fn red_stays_red() {
+        let mut out = [0u8; 8];
+        rgba_to_bgra(&[200, 10, 20, 255, 100, 0, 0, 128], &mut out);
+        assert_eq!(out, [20, 10, 200, 255, 0, 0, 100, 128]);
     }
 }
