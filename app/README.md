@@ -49,6 +49,9 @@ Style: `WS_POPUP` -- no title bar, border or menu. The window is exactly our pix
   check this; measured slip is ~0.00002 px/frame.)
 - **Stopping**: stops only happen at gait phases where all six feet are on the ground
   (multiples of half a cycle), so no foot is left hanging in the air.
+- **Pause**: `Clock` only accumulates time while running and re-bases on every Pause/Resume, so
+  a 10 s pause costs the fly no time and Resume continues exactly where it stopped. While paused
+  the loop only pumps messages: no stepping, drawing or `UpdateLayeredWindow`.
 - **Frame-rate independence**: motion uses `Instant` deltas (capped at 100 ms, because the
   tray menu is modal and blocks the loop while open).
 - **`windows_subsystem = "windows"`**: otherwise a console flashes up on every launch.

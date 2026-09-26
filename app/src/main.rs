@@ -47,6 +47,31 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
+/// The fly's own clock: seconds of *running* time only. `tick` returns the time since the
+/// previous tick, but 0 while paused, and `set_paused` re-bases the reference point, so
+/// however long a pause lasts, Resume continues from exactly where the fly stopped.
+struct Clock {
+    last: Instant,
+    paused: bool,
+}
+
+impl Clock {
+    /// Longest step we'll ever report. The tray menu is modal and blocks the loop while it's
+    /// open, so a stall must not teleport the fly.
+    const MAX_DT: f32 = 0.1;
+
+    fn tick(&mut self, now: Instant) -> f32 {
+        let dt = if self.paused { 0.0 } else { now.duration_since(self.last).as_secs_f32() };
+        self.last = now;
+        dt.min(Self::MAX_DT)
+    }
+
+    fn set_paused(&mut self, paused: bool, now: Instant) {
+        self.paused = paused;
+        self.last = now; // time up to here is settled; nothing before it is counted later
+    }
+}
+
 /// tiny-skia produces premultiplied RGBA bytes; a Windows DIB wants premultiplied BGRA.
 /// Same numbers, red and blue swapped. Skip this and the fly comes out blue-eyed and bluish.
 fn rgba_to_bgra(src: &[u8], dst: &mut [u8]) {
@@ -248,9 +273,8 @@ fn main() {
 
     // Fixed-step loop: drain messages, render when a frame is due, otherwise sleep ~1 ms.
     // No WM_TIMER; the later 1 kHz brain tick slots in next to the render step.
-    let mut paused = false;
-    let mut last = Instant::now();
-    let mut next_frame = last;
+    let mut clock = Clock { last: Instant::now(), paused: false };
+    let mut next_frame = clock.last;
     let mut msg = Default::default();
     'main: loop {
         // SAFETY: `msg` is a valid MSG out-param; PeekMessage (non-blocking) fills it.
@@ -270,14 +294,15 @@ fn main() {
                 break 'main;
             }
             if e.id == *pause.id() {
-                paused = !paused;
+                let paused = !clock.paused;
+                clock.set_paused(paused, Instant::now());
                 pause.set_text(if paused { "Resume" } else { "Pause" });
-                last = Instant::now(); // don't count the paused time as one giant frame
             }
         }
 
         // The fly is drawn at a physical size, so a new scale means a new window size and
-        // new buffers. (Redraw even when paused, or the resized window would be blank.)
+        // new buffers. Only the buffers: while paused nothing is drawn or pushed to the screen,
+        // so the window keeps its old picture until Resume, whose first frame redraws it.
         let mut redraw = DPI_CHANGED.swap(false, Ordering::Relaxed);
         if redraw {
             scale = dpi_scale(hwnd);
@@ -287,23 +312,18 @@ fn main() {
             feet = Feet::new(&pose, scale); // feet are pinned in screen pixels: re-pin at the new scale
         }
 
-        if paused {
-            // Nothing moves, so nothing to draw: check the tray a few times a second.
-            if redraw {
-                canvas.present(hwnd, &pose, &feet, scale);
-            }
+        if clock.paused {
+            // No stepping, no drawing, no UpdateLayeredWindow: just keep pumping messages
+            // (the loop above) a few times a second so the tray still responds.
             std::thread::sleep(Duration::from_millis(30));
             continue;
         }
 
         let now = Instant::now();
         if now >= next_frame {
-            // Motion is driven by real elapsed time, not by counting frames, so a dropped
-            // frame doesn't change the fly's speed. The cap stops one long stall (e.g. the
-            // tray menu is modal and blocks this loop while open) from teleporting it.
-            let dt = now.duration_since(last).as_secs_f32().min(0.1);
-            last = now;
-            step = walker.step(dt);
+            // Motion is driven by real elapsed running time, not by counting frames, so a
+            // dropped frame doesn't change the fly's speed (see `Clock`).
+            step = walker.step(clock.tick(now));
             pose = to_pose(&step, scale, center);
             feet.update(&pose, scale);
             redraw = true;
@@ -325,6 +345,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pause for 10 s (simulated timeline, no sleeping): after Resume the fly must be exactly
+    /// where a fly that never paused is after the same amount of *running* time.
+    #[test]
+    fn pause_loses_no_time_and_adds_none() {
+        let t0 = Instant::now();
+        let frame = Duration::from_micros(16_667);
+        // What the real loop does each due frame: tick the clock, step the walker.
+        let frames = |clock: &mut Clock, fly: &mut path::Walker, now: &mut Instant, n: u32| {
+            for _ in 0..n {
+                *now += frame;
+                fly.step(clock.tick(*now));
+            }
+        };
+
+        let (mut clock, mut fly, mut now) = (Clock { last: t0, paused: false }, path::Walker::new(), t0);
+        frames(&mut clock, &mut fly, &mut now, 300);
+        clock.set_paused(true, now);
+        now += Duration::from_secs(10); // paused: the real loop skips tick() entirely
+        clock.set_paused(false, now);
+        now += frame;
+        let first = clock.tick(now);
+        assert!((first - 0.016667).abs() < 1e-4, "first frame after Resume was {first}s");
+        fly.step(first);
+        frames(&mut clock, &mut fly, &mut now, 299);
+
+        let (mut steady_clock, mut steady, mut steady_now) =
+            (Clock { last: t0, paused: false }, path::Walker::new(), t0);
+        frames(&mut steady_clock, &mut steady, &mut steady_now, 600);
+
+        let (a, b) = (fly.step(0.0), steady.step(0.0));
+        assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "fly jumped ahead");
+    }
 
     /// Channel order is the silent bug: red must stay red. tiny-skia RGBA [R,G,B,A] in,
     /// Windows BGRA out.
