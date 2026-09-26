@@ -302,8 +302,9 @@ fn main() {
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 
     // Fixed-step loop: drain messages, render when a frame is due, otherwise sleep until it is.
-    // No WM_TIMER. Messages (the tray) wait at most one frame.
-    // ponytail: the later 1 kHz brain tick needs a shorter sleep here, only while it runs.
+    // No WM_TIMER. Messages (the tray) wait at most one frame. The 1 kHz brain (milestone 3)
+    // steps in catch-up batches inside the frame (~16 steps at 60 Hz, sized from elapsed time),
+    // so it needs no extra wake-ups: a 1 ms sleep here would cost ~1% of a core at rest.
     let mut clock = Clock { last: Instant::now(), paused: false };
     let mut next_frame = clock.last;
     let mut msg = Default::default();
