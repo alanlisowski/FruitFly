@@ -1,0 +1,5 @@
+core/out/
+data/*.csv.gz
+data/*.tsv
+data/*.feather
+__pycache__/
