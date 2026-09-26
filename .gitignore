@@ -3,3 +3,4 @@ data/*.csv.gz
 data/*.tsv
 data/*.feather
 __pycache__/
+reference_fly*.jpg

@@ -4,7 +4,7 @@
 //! *logical* pixels (96 dpi); `main` scales to physical pixels, so a DPI change never
 //! changes where the fly is along its route or how fast it walks.
 
-use crate::fly::{BODY_SCALE, CYCLE};
+use crate::fly::{CYCLE, FLY_SCALE};
 use std::f64::consts::TAU;
 
 // Figure-eight (lemniscate of Gerono): x = A sin t, y = (B/2) sin 2t. 600 wide, 100 tall each side.
@@ -12,7 +12,7 @@ const A: f64 = 300.0;
 const B: f64 = 200.0;
 
 /// Logical px the body walks per gait cycle (see `fly::CYCLE`).
-const CYCLE_PX: f64 = (BODY_SCALE * CYCLE) as f64;
+const CYCLE_PX: f64 = (FLY_SCALE * CYCLE) as f64;
 /// Gait phase at distance 0: the middle of the window where all six feet are on the ground.
 const REST_PHASE: f64 = 0.45;
 
@@ -137,7 +137,7 @@ mod tests {
         FlyPose { x: s.x, y: s.y, heading: s.heading, speed: s.speed, gait_phase: s.gait_phase }
     }
     fn world(f: &Feet, s: &Step) -> Vec<(f32, f32)> {
-        (0..6).map(|i| to_world(f.pos(i), &pose(s), BODY_SCALE)).collect()
+        (0..6).map(|i| to_world(f.pos(i), &pose(s), FLY_SCALE)).collect()
     }
 
     /// Runs several laps at 60 fps (with an occasional dropped frame) and checks the feet

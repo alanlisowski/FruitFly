@@ -1,16 +1,12 @@
-//! The fly's body: a pose, the feet, and a pure function that draws them. No Win32 in here, so
-//! the brain (milestone 3) can drive `FlyPose` without touching any rendering code.
+//! The fly's pose and gait: where the body is, and where each of the six feet stands.
+//! Drawing lives in `art.rs`. No Win32 in either, so the brain (milestone 3) can drive
+//! `FlyPose` without touching rendering code.
 //!
-//! Proportions and colours are ported from `drawFly()` / `LEGS` in clients/web/index.html.
-//! All "web units" below are that file's canvas units; `draw` multiplies them by
-//! `BODY_SCALE * dpi_scale` to get physical pixels.
+//! Body space (same as the reference drawing): the fly faces +x, y points down (so +y is the
+//! fly's right), 1 unit = 1 px at 100% display scale *before* `FLY_SCALE`.
 
-use tiny_skia::{
-    Color, FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
-};
-
-/// The web version does `ctx.scale(1.35, 1.35)` before drawing the fly.
-pub const BODY_SCALE: f32 = 1.35;
+/// Reference `FLY_SCALE`: ~90 px nose to wingtip at 100% display scale.
+pub const FLY_SCALE: f32 = 2.4;
 
 // --- Gait ---------------------------------------------------------------------------------
 // One gait cycle per leg = STANCE (foot on the ground, moving backward relative to the body)
@@ -18,24 +14,29 @@ pub const BODY_SCALE: f32 = 1.35;
 // cycle apart, so three feet are always down.
 const STANCE: f32 = 0.6;
 const SWING: f32 = 1.0 - STANCE;
-/// How far (web units) a planted foot travels backward relative to the body per step.
-const STRIDE: f32 = 12.0;
+/// How far (body units) a planted foot travels backward relative to the body per step.
+/// (The reference's `stride=+-3` stand-in is a similar range, -3..+3.) 5 is the largest round
+/// value at which no legs cross at ANY gait phase: at 6 a same-side front and middle leg form
+/// an X for a third of the cycle, because with 60% stance the two tripods aren't mirror images
+/// mid-step. `legs_never_cross_and_never_stretch` in art.rs guards it.
+const STRIDE: f32 = 5.0;
 /// Peak lift of a swinging foot, drawn as a sideways offset (we look from above).
-const LIFT: f32 = 2.5;
-/// Distance the body walks per full gait cycle. Derivation: a foot stays put on the ground for
-/// the whole stance (60% of the cycle), during which it moves back `STRIDE` relative to the
-/// body, so the body must travel exactly `STRIDE` in 60% of the cycle => STRIDE / 0.6.
+const LIFT: f32 = 1.2;
+/// Distance the body walks per full gait cycle. A foot stays put on the ground for the whole
+/// stance (60% of the cycle), during which it moves back `STRIDE` relative to the body, so the
+/// body must travel exactly `STRIDE` in 60% of the cycle => STRIDE / 0.6.
 pub const CYCLE: f32 = STRIDE / STANCE;
 
-/// Farthest any part of the fly can reach from its centre, in web units, at any heading, gait
-/// phase or turn rate. Sizes the window. (Leg L3 at full stride is ~33; wings/abdomen ~29;
-/// the rest is margin. `fits_in_window` below proves it by rendering.)
-const RADIUS: f32 = 36.0;
+/// Farthest any painted pixel can be from the fly's centre, in body units, at any heading and
+/// gait phase: legs at full stretch (~27 incl. tarsus and outline), wings (~25), and the
+/// shadow (~32 to where it fades to nothing, see `art::draw_shadow`). Sizes the window;
+/// `fits_in_window` proves it by rendering.
+const RADIUS: f32 = 33.0;
 
 /// Window edge length in physical pixels for a given DPI scale (dpi / 96).
 /// Even, so the centre is a whole pixel, plus a small margin for anti-aliasing.
 pub fn window_size(scale: f32) -> i32 {
-    ((2.0 * RADIUS * BODY_SCALE * scale).ceil() as i32 + 4 + 1) & !1
+    ((2.0 * RADIUS * FLY_SCALE * scale).ceil() as i32 + 4 + 1) & !1
 }
 
 /// Where the fly is and how its legs are. Everything the drawing needs, nothing it doesn't.
@@ -54,36 +55,56 @@ pub struct FlyPose {
     pub gait_phase: f32,
 }
 
-/// Web `LEGS` table. `side`: -1 = fly's left, +1 = right. `base`: where the leg joins the body
-/// (fraction of 13 along the body). `ang`/`len`: neutral direction and reach of the leg.
-/// `phase`: tripod membership (L1, R2, L3 = 0.0; R1, L2, R3 = 0.5).
-struct LegSpec {
-    side: f32,
-    base: f32,
-    ang: f32,
-    len: f32,
-    phase: f32,
-}
-const LEGS: [LegSpec; 6] = [
-    LegSpec { side: -1.0, base: -0.30, ang: -1.05, len: 20.0, phase: 0.0 }, // L1
-    LegSpec { side: -1.0, base: 0.02, ang: -1.55, len: 22.0, phase: 0.5 },  // L2
-    LegSpec { side: -1.0, base: 0.34, ang: -2.05, len: 24.0, phase: 0.0 },  // L3
-    LegSpec { side: 1.0, base: -0.30, ang: 1.05, len: 20.0, phase: 0.5 },   // R1
-    LegSpec { side: 1.0, base: 0.02, ang: 1.55, len: 22.0, phase: 0.0 },    // R2
-    LegSpec { side: 1.0, base: 0.34, ang: 2.05, len: 24.0, phase: 0.5 },    // R3
+/// Reference `LEGS`: attach x, |attach y|, direction from forward axis (deg), femur, tibia,
+/// tarsus. Front, middle, back.
+pub const LEGS: [(f32, f32, f32, f32, f32, f32); 3] = [
+    (7.5, 5.4, 44.0, 7.0, 7.4, 4.0),
+    (3.5, 7.0, 94.0, 7.4, 8.2, 4.2),
+    (-0.5, 6.4, 140.0, 8.2, 9.4, 4.6),
 ];
 
-/// Centre-relative geometry of one leg, in body coordinates (web units, +x = forward,
-/// +y = the fly's right): where it joins the body, its neutral foot spot, and where a swinging
-/// foot touches down (half a stride ahead of neutral, so the stance carries it half a stride
-/// behind).
-fn geometry(l: &LegSpec) -> ((f32, f32), (f32, f32), (f32, f32)) {
-    let base = (l.base * 13.0, l.side * 4.2);
-    let neutral = (base.0 + l.ang.cos() * l.len, base.1 + l.ang.sin() * l.len);
-    (base, neutral, (neutral.0 + STRIDE / 2.0, neutral.1))
+/// Foot index `k` (0..6): 0..3 = left side (y < 0) front..back, 3..6 = right side.
+pub fn side_of(k: usize) -> f32 {
+    if k < 3 { -1.0 } else { 1.0 }
 }
 
-/// Body coordinates (web units) -> screen pixels, and back.
+/// Static geometry of one leg, in body coordinates.
+pub struct LegGeo {
+    /// Where the leg joins the body.
+    pub attach: (f32, f32),
+    /// Femur + tibia: the farthest a foot can be from `attach`.
+    pub full: f32,
+    /// Where a swinging foot touches down (half a stride ahead of the neutral spot, so the
+    /// stance carries it half a stride behind).
+    pub touchdown: (f32, f32),
+    /// Tripod membership: legs of one tripod share a phase, the other tripod is half a cycle
+    /// away. Same alternation as the reference (front and back of one side + middle of the other).
+    pub phase: f32,
+}
+
+pub fn leg_geo(k: usize) -> LegGeo {
+    let (side, i) = (side_of(k), k % 3);
+    let (ax, ay, deg, f, t, _) = LEGS[i];
+    let attach = (ax, ay * side);
+    let th = deg.to_radians();
+    let dir = (th.cos(), th.sin() * side);
+    let full = f + t;
+    // Neutral foot spot: 90% of full reach along the leg's direction, as in the reference.
+    let neutral = (attach.0 + dir.0 * 0.90 * full, attach.1 + dir.1 * 0.90 * full);
+    // The reference's stand-in stride of +-3 around that spot overshoots full reach on the
+    // front and back legs (they'd have to stretch). Legs here have FIXED segment lengths, so
+    // slide the stride window along x, only as far as needed, until both ends of the stride
+    // are within 98% of full reach. (Shrinking the neutral spot instead bends the knees more
+    // and makes same-side legs cross sooner.)
+    let h = STRIDE / 2.0;
+    let root = ((0.98 * full).powi(2) - (0.90 * full * dir.1).powi(2)).sqrt(); // max |x| from the hip
+    let (lo, hi) = (0.90 * full * dir.0 - h, 0.90 * full * dir.0 + h);
+    let shift = if hi > root { root - hi } else if lo < -root { -root - lo } else { 0.0 };
+    let phase = if (i % 2 == 0) == (side > 0.0) { 0.0 } else { 0.5 };
+    LegGeo { attach, full, touchdown: (neutral.0 + shift + h, neutral.1), phase }
+}
+
+/// Body coordinates (body units) -> screen pixels, and back. `unit` = px per body unit.
 pub fn to_world(p: (f32, f32), pose: &FlyPose, unit: f32) -> (f32, f32) {
     let (s, c) = pose.heading.sin_cos();
     (pose.x + (c * p.0 - s * p.1) * unit, pose.y + (s * p.0 + c * p.1) * unit)
@@ -115,24 +136,26 @@ pub struct Feet([Foot; 6]);
 impl Feet {
     /// Feet as they'd be if the fly had been walking straight to reach `pose`.
     pub fn new(pose: &FlyPose, scale: f32) -> Feet {
-        let unit = BODY_SCALE * scale;
-        Feet(LEGS.each_ref().map(|l| {
-            let (_, _, touchdown) = geometry(l);
-            let ph = (pose.gait_phase + l.phase).rem_euclid(1.0);
+        let unit = FLY_SCALE * scale;
+        let mut feet = [Foot { planted: true, anchor: (0.0, 0.0), from: (0.0, 0.0), pos: (0.0, 0.0) }; 6];
+        for (k, f) in feet.iter_mut().enumerate() {
+            let g = leg_geo(k);
+            let ph = (pose.gait_phase + g.phase).rem_euclid(1.0);
             // Stance: foot has slid back `STRIDE * progress` from touchdown. Swing: hovering at
             // the lift-off end, and `update` will carry it forward.
             let back = if ph < SWING { STRIDE } else { STRIDE * (ph - SWING) / STANCE };
-            let pos = (touchdown.0 - back, touchdown.1);
-            Foot { planted: ph >= SWING, anchor: to_world(pos, pose, unit), from: pos, pos }
-        }))
+            let pos = (g.touchdown.0 - back, g.touchdown.1);
+            *f = Foot { planted: ph >= SWING, anchor: to_world(pos, pose, unit), from: pos, pos };
+        }
+        Feet(feet)
     }
 
     /// Moves the feet to match `pose`. Call once per pose change, before `draw`.
     pub fn update(&mut self, pose: &FlyPose, scale: f32) {
-        let unit = BODY_SCALE * scale;
-        for (f, l) in self.0.iter_mut().zip(&LEGS) {
-            let (_, _, touchdown) = geometry(l);
-            let ph = (pose.gait_phase + l.phase).rem_euclid(1.0);
+        let unit = FLY_SCALE * scale;
+        for (k, f) in self.0.iter_mut().enumerate() {
+            let g = leg_geo(k);
+            let ph = (pose.gait_phase + g.phase).rem_euclid(1.0);
             if ph < SWING {
                 if f.planted {
                     f.planted = false; // lift-off: remember where the foot is
@@ -140,13 +163,16 @@ impl Feet {
                 }
                 let u = ph / SWING;
                 let e = u * u * (3.0 - 2.0 * u); // smoothstep: leaves and lands gently
-                f.pos = (f.from.0 + (touchdown.0 - f.from.0) * e, f.from.1 + (touchdown.1 - f.from.1) * e);
+                f.pos = (
+                    f.from.0 + (g.touchdown.0 - f.from.0) * e,
+                    f.from.1 + (g.touchdown.1 - f.from.1) * e,
+                );
                 // From above there is no "up", so a lifted foot is nudged outward instead.
-                f.pos.1 += l.side * LIFT * (std::f32::consts::PI * u).sin();
+                f.pos.1 += side_of(k) * LIFT * (std::f32::consts::PI * u).sin();
             } else {
                 if !f.planted {
                     f.planted = true; // touchdown: pin this spot to the screen
-                    f.anchor = to_world(touchdown, pose, unit);
+                    f.anchor = to_world(g.touchdown, pose, unit);
                 }
                 f.pos = to_body(f.anchor, pose, unit);
             }
@@ -154,86 +180,31 @@ impl Feet {
     }
 
     #[cfg(test)]
-    pub fn planted(&self, i: usize) -> bool {
-        self.0[i].planted
+    pub fn planted(&self, k: usize) -> bool {
+        self.0[k].planted
     }
 
-    /// Foot `i`'s position in body coordinates.
-    pub fn pos(&self, i: usize) -> (f32, f32) {
-        self.0[i].pos
+    /// Foot `k`'s position in body coordinates.
+    pub fn pos(&self, k: usize) -> (f32, f32) {
+        self.0[k].pos
     }
 }
 
-fn color(rgb: u32, alpha: f32) -> Color {
-    Color::from_rgba8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, (alpha * 255.0).round() as u8)
-}
-
-fn oval(cx: f32, cy: f32, rx: f32, ry: f32) -> Path {
-    // Built around (0,0) rotation-free; callers rotate/translate with a Transform.
-    PathBuilder::from_oval(Rect::from_xywh(cx - rx, cy - ry, 2.0 * rx, 2.0 * ry).unwrap()).unwrap()
-}
-
-/// Draws `pose` into `pixmap` (cleared first). `scale` = dpi / 96. `origin` is the screen
-/// position of the pixmap's top-left pixel, i.e. the window's position: the fly lands at
-/// `pose.xy - origin`, so if the window sits at the *floored* position the fractional part
-/// of `pose.xy` shifts the drawing inside the pixmap and slow motion doesn't jitter.
-pub fn draw(pose: &FlyPose, feet: &Feet, scale: f32, pixmap: &mut Pixmap, origin: (i32, i32)) {
-    pixmap.fill(Color::TRANSPARENT);
-    let unit = BODY_SCALE * scale;
-    // Transforms apply right-to-left to a point: scale web units -> px, rotate to heading,
-    // move to the fly's position. (tiny-skia's `pre_*` means "applied before what's there".)
-    let body = Transform::from_translate(pose.x - origin.0 as f32, pose.y - origin.1 as f32)
-        .pre_rotate(pose.heading.to_degrees()) // tiny-skia rotates in degrees, not radians
-        .pre_scale(unit, unit);
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
-
-    // Legs.
-    paint.set_color(color(0x6f7987, 1.0));
-    let stroke = Stroke { width: 1.6, line_cap: LineCap::Round, ..Default::default() };
-    for (i, l) in LEGS.iter().enumerate() {
-        let (base, neutral, _) = geometry(l);
-        let foot = feet.pos(i);
-        // Knee control point: the web version's, dragged 40% of the way with the foot.
-        let knee_a = l.ang - l.side * 0.42;
-        let knee = (
-            base.0 + knee_a.cos() * l.len * 0.52 + (foot.0 - neutral.0) * 0.4,
-            base.1 + knee_a.sin() * l.len * 0.52 + (foot.1 - neutral.1) * 0.4,
-        );
-        let mut pb = PathBuilder::new();
-        pb.move_to(base.0, base.1);
-        pb.quad_to(knee.0, knee.1, foot.0, foot.1);
-        pixmap.stroke_path(&pb.finish().unwrap(), &paint, &stroke, body, None);
-    }
-
-    // Wings (folded back at rest; the web version only spreads them when buzzing).
-    let wing_stroke = Stroke { width: 0.7, ..Default::default() };
-    for w in [-1.0_f32, 1.0] {
-        let t = body
-            .pre_rotate((w * 0.34).to_degrees())
-            .pre_translate(-13.0, w * 3.4)
-            .pre_rotate((w * 0.24).to_degrees());
-        let wing = oval(0.0, 0.0, 15.5, 5.2);
-        paint.set_color(color(0xbed2e8, 0.17));
-        pixmap.fill_path(&wing, &paint, FillRule::Winding, t, None);
-        paint.set_color(color(0xbed2e8, 0.28));
-        pixmap.stroke_path(&wing, &paint, &wing_stroke, t, None);
-    }
-
-    // Abdomen (two layers), thorax, head, then eyes on top.
-    for (rgb, cx, rx, ry) in [
-        (0x2c2418, -11.5, 12.5, 7.2),
-        (0x3a301f, -10.5, 11.0, 6.2),
-        (0x4a3c26, 1.0, 9.5, 7.0),
-        (0x57462c, 11.0, 6.2, 6.0),
-    ] {
-        paint.set_color(color(rgb, 1.0));
-        pixmap.fill_path(&oval(cx, 0.0, rx, ry), &paint, FillRule::Winding, body, None);
-    }
-    paint.set_color(color(0x8f2f28, 1.0));
-    for (y, tilt) in [(-4.2_f32, -0.3_f32), (4.2, 0.3)] {
-        let t = body.pre_translate(12.5, y).pre_rotate(tilt.to_degrees());
-        pixmap.fill_path(&oval(0.0, 0.0, 4.1, 3.6), &paint, FillRule::Winding, t, None);
+/// Test helper: walks a pose along a circle of the given radius (physical px; 1e9 = straight)
+/// for `steps` steps, calling `each` after every step with the updated feet.
+#[cfg(test)]
+pub fn walk(scale: f32, radius: f32, steps: usize, mut each: impl FnMut(&FlyPose, &Feet)) {
+    let unit = FLY_SCALE * scale;
+    let step = 2.0 * scale; // px per step
+    let mut pose = FlyPose { x: 500.0, y: 500.0, heading: 0.0, speed: 1.0, gait_phase: 0.45 };
+    let mut feet = Feet::new(&pose, scale);
+    for _ in 0..steps {
+        pose.heading += step / radius;
+        pose.x += pose.heading.cos() * step;
+        pose.y += pose.heading.sin() * step;
+        pose.gait_phase = (pose.gait_phase + step / (unit * CYCLE)).rem_euclid(1.0);
+        feet.update(&pose, scale);
+        each(&pose, &feet);
     }
 }
 
@@ -241,58 +212,16 @@ pub fn draw(pose: &FlyPose, feet: &Feet, scale: f32, pixmap: &mut Pixmap, origin
 mod tests {
     use super::*;
 
-    /// Walks a pose along a circle of the given radius (physical px; 1e9 = straight) for a few
-    /// laps, calling `each` after every step with the updated feet.
-    fn walk(scale: f32, radius: f32, mut each: impl FnMut(&FlyPose, &Feet)) {
-        let unit = BODY_SCALE * scale;
-        let step = 2.0 * scale; // px per step
-        let mut pose = FlyPose { x: 500.0, y: 500.0, heading: 0.0, speed: 1.0, gait_phase: 0.45 };
-        let mut feet = Feet::new(&pose, scale);
-        for _ in 0..800 {
-            pose.heading += step / radius;
-            pose.x += pose.heading.cos() * step;
-            pose.y += pose.heading.sin() * step;
-            pose.gait_phase = (pose.gait_phase + step / (unit * CYCLE)).rem_euclid(1.0);
-            feet.update(&pose, scale);
-            each(&pose, &feet);
-        }
-    }
-
-    /// The window is sized from RADIUS, so nothing may ever be drawn on the pixmap's border
-    /// pixels: try straight and tight left/right curves at 100%, 150% and 200% scaling, with
-    /// the worst-case fractional position.
-    #[test]
-    fn fits_in_window() {
-        for scale in [1.0, 1.5, 2.0] {
-            let size = window_size(scale);
-            let n = size as usize;
-            let mut pm = Pixmap::new(size as u32, size as u32).unwrap();
-            for radius in [1e9, 60.0 * scale, -60.0 * scale] {
-                walk(scale, radius, |pose, feet| {
-                    let mut p = *pose;
-                    (p.x, p.y) = (p.x.floor() + 0.99, p.y.floor() + 0.99);
-                    let origin = (p.x.floor() as i32 - size / 2, p.y.floor() as i32 - size / 2);
-                    draw(&p, feet, scale, &mut pm, origin);
-                    let edge = |i: usize| pm.data()[i * 4 + 3] != 0;
-                    for i in 0..n {
-                        assert!(!edge(i) && !edge((n - 1) * n + i), "top/bottom edge hit");
-                        assert!(!edge(i * n) && !edge(i * n + n - 1), "left/right edge hit");
-                    }
-                });
-            }
-        }
-    }
-
     /// The whole point of the anchoring: a planted foot doesn't move on the screen, on
     /// straight or curved paths. And feet never teleport.
     #[test]
     fn planted_feet_stay_put() {
         for radius in [1e9, 60.0, -60.0] {
             let mut prev: Option<(Vec<bool>, Vec<(f32, f32)>, Vec<(f32, f32)>)> = None;
-            walk(1.0, radius, |pose, feet| {
+            walk(1.0, radius, 800, |pose, feet| {
                 let planted: Vec<_> = (0..6).map(|i| feet.planted(i)).collect();
                 let pos: Vec<_> = (0..6).map(|i| feet.pos(i)).collect();
-                let world: Vec<_> = pos.iter().map(|&p| to_world(p, pose, BODY_SCALE)).collect();
+                let world: Vec<_> = pos.iter().map(|&p| to_world(p, pose, FLY_SCALE)).collect();
                 if let Some((pp, ppos, pw)) = &prev {
                     for i in 0..6 {
                         if pp[i] && planted[i] {
@@ -300,11 +229,32 @@ mod tests {
                             assert!(d < 0.01, "foot {i} slid {d} px");
                         }
                         let j = (ppos[i].0 - pos[i].0).hypot(ppos[i].1 - pos[i].1);
-                        assert!(j < 6.0, "foot {i} jumped {j} units");
+                        assert!(j < 4.0, "foot {i} jumped {j} units");
                     }
                 }
                 prev = Some((planted, pos, world));
             });
         }
+    }
+
+    /// Fixed segment lengths need every foot within reach of its hip. On straight walking and on
+    /// the route's tightest turns (radius ~133 px) no foot may ask for more than full reach, and
+    /// the drawing's 99.5% safety clamp may only ever nudge a foot by a hair (< 0.3 units).
+    #[test]
+    fn feet_stay_within_reach() {
+        let mut worst_clamp = 0.0_f32;
+        for radius in [1e9, 133.0, -133.0] {
+            walk(1.0, radius, 800, |_, feet| {
+                for k in 0..6 {
+                    let g = leg_geo(k);
+                    let p = feet.pos(k);
+                    let d = (p.0 - g.attach.0).hypot(p.1 - g.attach.1);
+                    assert!(d <= g.full, "foot {k} at {d} > full reach {}", g.full);
+                    worst_clamp = worst_clamp.max(d - 0.995 * g.full);
+                }
+            });
+        }
+        println!("worst clamp nudge: {worst_clamp} body units");
+        assert!(worst_clamp < 0.3, "clamp moves feet by {worst_clamp}");
     }
 }

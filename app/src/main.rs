@@ -1,13 +1,15 @@
 // Without this, Windows gives a GUI-less process a console window that flashes up on every launch.
 #![windows_subsystem = "windows"]
 
+mod art;
 mod fly;
 mod path;
+mod snapshot;
 
 use fly::{Feet, FlyPose};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tiny_skia::Pixmap;
+use tiny_skia::{Color, Pixmap};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
@@ -16,6 +18,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
     SelectObject,
 };
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -132,7 +135,8 @@ impl Canvas {
             pose.x.floor() as i32 - self.size / 2,
             pose.y.floor() as i32 - self.size / 2,
         );
-        fly::draw(pose, feet, scale, &mut self.pixmap, origin);
+        self.pixmap.fill(Color::TRANSPARENT);
+        art::draw(pose, feet, scale, &mut self.pixmap, origin);
 
         // SAFETY: `bits` points to size*size*4 bytes (see `new`), and `&mut self` means nothing
         // else is touching them. Every pointer handed to UpdateLayeredWindow refers to a local
@@ -204,6 +208,19 @@ fn to_pose(s: &path::Step, scale: f32, center: (f32, f32)) -> FlyPose {
 }
 
 fn main() {
+    // `flit --snapshot <dir>`: render the reference images and exit, no window. A windows-
+    // subsystem exe has no console of its own, so borrow the parent's to be able to print.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--snapshot") {
+        // SAFETY: plain FFI call; failing just means there is no parent console to print to.
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+        match snapshot::run(std::path::Path::new(args.get(2).map(String::as_str).unwrap_or("."))) {
+            Ok(()) => println!("snapshots written"),
+            Err(e) => println!("snapshot failed: {e}"),
+        }
+        return;
+    }
+
     // SAFETY: plain FFI call with a constant. Must be the FIRST thing we do, before any window
     // exists; otherwise Windows "virtualises" our coordinates on scaled displays (125%, 150%...)
     // and the window lands in the wrong place. PER_MONITOR_AWARE_V2 = we get real pixels and are
