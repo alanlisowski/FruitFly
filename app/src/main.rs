@@ -91,10 +91,14 @@ struct Canvas {
     dc: HDC,
     bmp: HBITMAP,
     bits: *mut u8,
+    cache: art::Cache,
+    /// (x, y, heading, gait phase) of the frame on screen. Same again = nothing to do.
+    shown: Option<[f32; 4]>,
 }
 
 impl Canvas {
-    fn new(size: i32) -> Self {
+    fn new(scale: f32) -> Self {
+        let size = fly::window_size(scale);
         // Negative biHeight = top-down (row 0 is the top), matching tiny-skia's row order.
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -124,11 +128,20 @@ impl Canvas {
             dc,
             bmp,
             bits: bits as *mut u8,
+            cache: art::Cache::new(scale, 0.0),
+            shown: None,
         }
     }
 
     /// Draws `pose` and pushes it to the screen, moving and (if needed) resizing the window.
+    /// Skips both if the fly looks exactly as it did last time (e.g. while it stands still).
     fn present(&mut self, hwnd: HWND, pose: &FlyPose, feet: &Feet, scale: f32) {
+        // Feet follow from these: they only move when the body moves or the gait advances.
+        let key = [pose.x, pose.y, pose.heading, pose.gait_phase];
+        if self.shown == Some(key) {
+            return;
+        }
+        self.shown = Some(key);
         // Whole-pixel window position (floored); the fly's fractional part is drawn *inside*
         // the pixmap. Rounding the window instead would make slow motion snap and shimmer.
         let origin = (
@@ -136,7 +149,7 @@ impl Canvas {
             pose.y.floor() as i32 - self.size / 2,
         );
         self.pixmap.fill(Color::TRANSPARENT);
-        art::draw(pose, feet, scale, &mut self.pixmap, origin);
+        self.cache.draw(pose, feet, scale, &mut self.pixmap, origin);
 
         // SAFETY: `bits` points to size*size*4 bytes (see `new`), and `&mut self` means nothing
         // else is touching them. Every pointer handed to UpdateLayeredWindow refers to a local
@@ -278,7 +291,7 @@ fn main() {
 
     let mut scale = dpi_scale(hwnd);
     let mut center = screen_center();
-    let mut canvas = Canvas::new(fly::window_size(scale));
+    let mut canvas = Canvas::new(scale);
     let mut walker = path::Walker::new();
     let mut step = walker.step(0.0);
     let mut pose = to_pose(&step, scale, center);
@@ -288,8 +301,9 @@ fn main() {
     // SAFETY: hwnd is a live window we created.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 
-    // Fixed-step loop: drain messages, render when a frame is due, otherwise sleep ~1 ms.
-    // No WM_TIMER; the later 1 kHz brain tick slots in next to the render step.
+    // Fixed-step loop: drain messages, render when a frame is due, otherwise sleep until it is.
+    // No WM_TIMER. Messages (the tray) wait at most one frame.
+    // ponytail: the later 1 kHz brain tick needs a shorter sleep here, only while it runs.
     let mut clock = Clock { last: Instant::now(), paused: false };
     let mut next_frame = clock.last;
     let mut msg = Default::default();
@@ -324,7 +338,7 @@ fn main() {
         if redraw {
             scale = dpi_scale(hwnd);
             center = screen_center();
-            canvas = Canvas::new(fly::window_size(scale));
+            canvas = Canvas::new(scale);
             pose = to_pose(&step, scale, center);
             feet = Feet::new(&pose, scale); // feet are pinned in screen pixels: re-pin at the new scale
         }
@@ -349,7 +363,7 @@ fn main() {
                 next_frame = now + FRAME; // fell behind: don't burst to catch up
             }
         } else if !redraw {
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(next_frame - now);
         }
         if redraw {
             canvas.present(hwnd, &pose, &feet, scale);

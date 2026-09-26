@@ -81,7 +81,17 @@ Style: `WS_POPUP` -- no title bar, border or menu. The window is exactly our pix
 
 ## Cost
 
-One frame is about 110 small tiny-skia draw calls: ~2.5 ms at 100% display scale, ~5 ms at
-200% (`cargo test --release draw_cost -- --ignored --nocapture`). At 60 Hz that is roughly
-15-30% of one core while walking. Ideas if it matters: cache the stroked outlines of the
-static shapes, skip redraws while the fly is stopped, or drop to 30 Hz at slow speeds.
+Only the legs change shape, so `art::Cache` keeps two bitmaps: the rigid body (wings, head,
+eyes, antennae...) rendered at 2x in body space, and the screen-space shadow. A frame is the
+shadow blit, the legs (9 batched draw calls), and the body blit rotated and scaled by 0.5
+(2x so rotation doesn't soften the outlines). The body bitmap is lit for one heading and
+re-rendered when the fly turns more than 8 deg away from it (~170 times a minute on the
+route); a scale change rebuilds both. `art::draw` stays the all-vector reference, and
+`cache_matches_vector` holds the two within 3/255. Frames where position, heading and gait
+phase are unchanged (standing still) are skipped entirely, and the loop sleeps until the next
+frame is due.
+
+Per frame on the route (`cargo test --release draw_cost -- --ignored --nocapture`): 100%
+0.75 ms (vector 2.0), 200% 1.7 ms (vector 3.6). Cache: 145 KiB at 100%, 560 KiB at 200%.
+In the app at 125%: ~9% of one core walking, of which `UpdateLayeredWindow` is ~0.5 ms a
+frame (~3%) on its own; ~0.1% standing still.

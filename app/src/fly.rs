@@ -5,8 +5,8 @@
 //! Body space (same as the reference drawing): the fly faces +x, y points down (so +y is the
 //! fly's right), 1 unit = 1 px at 100% display scale *before* `FLY_SCALE`.
 
-/// Reference `FLY_SCALE`: ~90 px nose to wingtip at 100% display scale.
-pub const FLY_SCALE: f32 = 2.4;
+/// Reference `FLY_SCALE`: ~70 px nose to wingtip at 100% display scale ("medium").
+pub const FLY_SCALE: f32 = 1.9;
 
 // --- Gait ---------------------------------------------------------------------------------
 // One gait cycle per leg = STANCE (foot on the ground, moving backward relative to the body)

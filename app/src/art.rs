@@ -14,11 +14,11 @@
 //!   geometry (fuzz, spikes, tuft) is generated once (`ART`), in body space, from a seeded RNG.
 
 use crate::fly::{FLY_SCALE, Feet, FlyPose, LEGS, leg_geo, side_of};
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 use std::sync::OnceLock;
 use tiny_skia::{
-    Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint, Path,
-    PathBuilder, Pixmap, Point, RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint, Path,
+    PathBuilder, Pixmap, PixmapPaint, Point, RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
 type Rgb = (f32, f32, f32);
@@ -318,35 +318,51 @@ fn joints(k: usize, feet: &Feet) -> Joints {
     Joints { attach: g.attach, knee, foot, tip }
 }
 
-/// The six legs, left side then right, each: three inked segments, bristles, round foot.
-fn draw_legs(c: &mut Ctx, feet: &Feet) {
+/// The six legs. All sit under the body, so strokes of one style are merged across legs (all
+/// femur halos in one path, all femurs in another, ...): 9 draw calls instead of 54. Halos go
+/// first, so a leg's halo never lightens another leg's ink.
+fn draw_legs(pm: &mut Pixmap, body: Transform, feet: &Feet) {
     let art = art();
+    let mut segs: [PathBuilder; 3] = Default::default(); // femurs, tibias, tarsi
+    let (mut spikes, mut tips) = (PathBuilder::new(), Vec::with_capacity(6));
     for k in 0..6 {
         let side = side_of(k);
         let Joints { attach, knee, foot, tip } = joints(k, feet);
-        ink_line(c, &[attach, knee], 2.2);
-        ink_line(c, &[knee, foot], 1.8);
-        ink_line(c, &[foot, tip], 1.4);
-
+        for (pb, (a, b)) in segs.iter_mut().zip([(attach, knee), (knee, foot), (foot, tip)]) {
+            pb.move_to(a.0, a.1);
+            pb.line_to(b.0, b.1);
+        }
         // Short bristles along the shin, pointing outward and toward the foot.
         let (sx, sy) = (foot.0 - knee.0, foot.1 - knee.1);
         let len = sx.hypot(sy).max(1e-6);
         let (ux, uy) = (sx / len, sy / len);
         let (nx, ny) = (-uy * side, ux * side);
-        let mut pb = PathBuilder::new();
         for (j, factor) in art.spikes[k].iter().enumerate() {
             let tt = (j + 1) as f32 / 3.0;
             let (x, y) = (knee.0 + sx * tt, knee.1 + sy * tt);
             let l = 1.4 * factor;
-            pb.move_to(x, y);
-            pb.line_to(x + (nx * 0.8 + ux * 0.6) * l, y + (ny * 0.8 + uy * 0.6) * l);
+            spikes.move_to(x, y);
+            spikes.line_to(x + (nx * 0.8 + ux * 0.6) * l, y + (ny * 0.8 + uy * 0.6) * l);
         }
-        stroke(c.pm, &pb.finish().unwrap(), solid(INK, 1.0), 0.6, true, c.body, None);
-
-        // little round foot instead of claws
-        fill(c.pm, &circle(tip.0, tip.1, 1.6), solid((1.0, 1.0, 1.0), 0.13), c.body, None);
-        fill(c.pm, &circle(tip.0, tip.1, 1.05), solid(INK, 1.0), c.body, None);
+        tips.push(tip);
     }
+    let segs = segs.map(|pb| pb.finish().unwrap());
+    let dots = |r: f32| {
+        let mut pb = PathBuilder::new();
+        tips.iter().for_each(|t| pb.push_circle(t.0, t.1, r));
+        pb.finish().unwrap()
+    };
+    const W: [f32; 3] = [2.2, 1.8, 1.4];
+    // faint light halo under the ink (so it survives dark backgrounds), little round feet
+    for (p, w) in segs.iter().zip(W) {
+        stroke(pm, p, solid((1.0, 1.0, 1.0), 0.13), w + 1.2, true, body, None);
+    }
+    fill(pm, &dots(1.6), solid((1.0, 1.0, 1.0), 0.13), body, None);
+    for (p, w) in segs.iter().zip(W) {
+        stroke(pm, p, solid(INK, 1.0), w, true, body, None);
+    }
+    stroke(pm, &spikes.finish().unwrap(), solid(INK, 1.0), 0.6, true, body, None);
+    fill(pm, &dots(1.05), solid(INK, 1.0), body, None);
 }
 
 fn draw_wing(c: &mut Ctx, side: f32) {
@@ -390,26 +406,34 @@ fn draw_shadow(pm: &mut Pixmap, centre: (f32, f32), unit: f32) {
     fill(pm, &circle(0.0, 0.0, 1.0), g, ts, None);
 }
 
+/// Transforms apply right-to-left to a point: scale body units -> px, rotate to heading, move to
+/// `centre`. (tiny-skia's `pre_*` means "applied before what's there"; it rotates in degrees.)
+fn body_ts(centre: (f32, f32), heading: f32, unit: f32) -> Transform {
+    Transform::from_translate(centre.0, centre.1).pre_rotate(heading.to_degrees()).pre_scale(unit, unit)
+}
+
 /// Draws the fly onto `pixmap` (which the caller has cleared or filled with a background).
 /// `scale` = dpi / 96. `origin` is the screen position of the pixmap's top-left pixel, i.e. the
 /// window's position: the fly lands at `pose.xy - origin`, so if the window sits at the
 /// *floored* position, the fractional part of `pose.xy` shifts the drawing inside the pixmap
 /// and slow motion doesn't jitter.
+///
+/// The all-vector reference path; the app draws through `Cache::draw`, which must match it.
 pub fn draw(pose: &FlyPose, feet: &Feet, scale: f32, pixmap: &mut Pixmap, origin: (i32, i32)) {
     let unit = FLY_SCALE * scale;
     let centre = (pose.x - origin.0 as f32, pose.y - origin.1 as f32);
     draw_shadow(pixmap, centre, unit);
+    let body = body_ts(centre, pose.heading, unit);
+    draw_legs(pixmap, body, feet);
+    draw_rigid(pixmap, body, pose.heading);
+}
 
-    // Transforms apply right-to-left to a point: scale body units -> px, rotate to heading,
-    // move to the fly's position. (tiny-skia's `pre_*` means "applied before what's there".)
-    let body = Transform::from_translate(centre.0, centre.1)
-        .pre_rotate(pose.heading.to_degrees()) // tiny-skia rotates in degrees, not radians
-        .pre_scale(unit, unit);
-    let mask = Mask::new(pixmap.width(), pixmap.height()).unwrap();
-    let mut c = Ctx { pm: pixmap, mask, body, l: light_in_body(pose.heading) };
+/// Everything that never changes shape: abdomen, thorax, head, eyes, antennae, wings, lit for
+/// `heading`.
+fn draw_rigid(pm: &mut Pixmap, body: Transform, heading: f32) {
+    let mask = Mask::new(pm.width(), pm.height()).unwrap();
+    let mut c = Ctx { pm, mask, body, l: light_in_body(heading) };
     let art = art();
-
-    draw_legs(&mut c, feet);
 
     // abdomen: chubby and round, with soft yellow segment arcs
     inked_part(&mut c, &art.abdomen, (-10.0, 0.0), 9.0, BODY, 1.0, true);
@@ -443,6 +467,65 @@ pub fn draw(pose: &FlyPose, feet: &Feet, scale: f32, pixmap: &mut Pixmap, origin
     // wings on top
     for s in [-1.0_f32, 1.0] {
         draw_wing(&mut c, s);
+    }
+}
+
+/// Body space covered by `draw_rigid`, in body units (x0, y0, w, h), with a margin
+/// (`cache_matches_vector` checks nothing reaches the edge).
+const RIGID: (f32, f32, f32, f32) = (-24.0, -22.0, 47.0, 44.0);
+/// Re-render the rigid bitmap once the heading drifts this far from the one it was lit for.
+/// Only the lighting goes stale; the rotation is exact every frame.
+const RELIGHT: f32 = 8.0 * PI / 180.0;
+
+/// Bitmaps of the parts that don't change shape, so a frame is two blits plus the legs.
+/// The rigid body is rendered at 2x and drawn scaled by 0.5: a 1x bitmap drawn at an
+/// arbitrary angle comes out soft; 2x keeps outlines as crisp as the vector path.
+pub struct Cache {
+    scale: f32,
+    heading: f32,
+    rigid: Pixmap,
+    /// Screen space, never rotated.
+    shadow: Pixmap,
+}
+
+impl Cache {
+    pub fn new(scale: f32, heading: f32) -> Self {
+        let unit = FLY_SCALE * scale;
+        let px = |w: f32| (w * unit).ceil() as u32 + 4;
+        let mut shadow = Pixmap::new(px(52.0), px(26.0)).unwrap();
+        let mid = (shadow.width() as f32 / 2.0 - 3.0 * unit, shadow.height() as f32 / 2.0 - 5.0 * unit);
+        draw_shadow(&mut shadow, mid, unit);
+        let rigid = Pixmap::new(px(2.0 * RIGID.2), px(2.0 * RIGID.3)).unwrap();
+        let mut cache = Cache { scale, heading, rigid, shadow };
+        cache.relight(heading);
+        cache
+    }
+
+    fn relight(&mut self, heading: f32) {
+        let u2 = 2.0 * FLY_SCALE * self.scale;
+        self.heading = heading;
+        self.rigid.fill(Color::TRANSPARENT);
+        draw_rigid(&mut self.rigid, Transform::from_scale(u2, u2).pre_translate(-RIGID.0, -RIGID.1), heading);
+    }
+
+    /// Same contract as `draw`. A different `scale` rebuilds the cache.
+    pub fn draw(&mut self, pose: &FlyPose, feet: &Feet, scale: f32, pixmap: &mut Pixmap, origin: (i32, i32)) {
+        if scale != self.scale {
+            *self = Cache::new(scale, pose.heading);
+        } else if ((pose.heading - self.heading + PI).rem_euclid(TAU) - PI).abs() > RELIGHT {
+            self.relight(pose.heading);
+        }
+        let unit = FLY_SCALE * scale;
+        let centre = (pose.x - origin.0 as f32, pose.y - origin.1 as f32);
+        let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+        let (sw, sh) = (self.shadow.width() as f32, self.shadow.height() as f32);
+        let shadow_at = Transform::from_translate(centre.0 + 3.0 * unit - sw / 2.0, centre.1 + 5.0 * unit - sh / 2.0);
+        pixmap.draw_pixmap(0, 0, self.shadow.as_ref(), &paint, shadow_at, None);
+        let body = body_ts(centre, pose.heading, unit);
+        draw_legs(pixmap, body, feet);
+        // bitmap px -> body units -> screen
+        let rigid_at = body.pre_translate(RIGID.0, RIGID.1).pre_scale(0.5 / unit, 0.5 / unit);
+        pixmap.draw_pixmap(0, 0, self.rigid.as_ref(), &paint, rigid_at, None);
     }
 }
 
@@ -538,6 +621,34 @@ mod tests {
         assert!(diff <= 1, "shading didn't follow the fly: max channel diff {diff}");
     }
 
+    /// The app's cached path must look like the vector path: at 0 deg (fresh cache), 7 deg
+    /// (lit for 0), 45 and 140 deg (relit), and 147 deg (7 deg past the 140 relight), at 100%,
+    /// 125% and 200%, on a window-sized pixmap. Same bar as the snapshot tests.
+    #[test]
+    fn cache_matches_vector() {
+        for scale in [1.0_f32, 1.25, 2.0] {
+            let size = window_size(scale) as u32;
+            let mut cache = Cache::new(scale, 0.0);
+            for deg in [0.0_f32, 7.0, 45.0, 140.0, 147.0] {
+                let c = size as f32 / 2.0 + 0.37;
+                let pose = FlyPose { x: c, y: c, heading: deg.to_radians(), speed: 0.0, gait_phase: 0.45 };
+                let feet = Feet::new(&pose, scale);
+                let (mut v, mut k) = (Pixmap::new(size, size).unwrap(), Pixmap::new(size, size).unwrap());
+                draw(&pose, &feet, scale, &mut v, (0, 0));
+                cache.draw(&pose, &feet, scale, &mut k, (0, 0));
+                let d = v.data().iter().zip(k.data()).map(|(a, b)| a.abs_diff(*b) as u64).sum::<u64>() as f32
+                    / v.data().len() as f32;
+                println!("scale {scale}, {deg} deg (lit for {:.0}): mean diff {d:.2} / 255", cache.heading.to_degrees());
+                assert!(d < 3.0, "cached fly differs at {scale}x, {deg} deg: {d}");
+                // RIGID is big enough: nothing painted on the bitmap's border
+                let (w, h) = (cache.rigid.width() as usize, cache.rigid.height() as usize);
+                let a = |x: usize, y: usize| cache.rigid.data()[(y * w + x) * 4 + 3];
+                assert!((0..w).all(|x| a(x, 0) == 0 && a(x, h - 1) == 0), "RIGID too small");
+                assert!((0..h).all(|y| a(0, y) == 0 && a(w - 1, y) == 0), "RIGID too small");
+            }
+        }
+    }
+
     fn ccw(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
         (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
     }
@@ -594,22 +705,47 @@ mod tests {
 mod bench {
     use super::*;
     use crate::fly::window_size;
-    /// Prints the cost of one frame's drawing at each display scale. Run:
-    /// `cargo test --release draw_cost -- --ignored --nocapture`
+    /// Prints the cost of one frame's drawing at each display scale, vector vs cached, over one
+    /// minute of the real route at 60 Hz (so the cached figure includes its relights), and the
+    /// cache's memory. Run: `cargo test --release draw_cost -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn draw_cost() {
-        for scale in [1.0_f32, 1.5, 2.0] {
+        for scale in [1.0_f32, 1.25, 2.0] {
             let size = window_size(scale);
             let mut pm = Pixmap::new(size as u32, size as u32).unwrap();
-            let pose = FlyPose { x: size as f32 / 2.0, y: size as f32 / 2.0, heading: 0.7, speed: 0.0, gait_phase: 0.45 };
-            let feet = Feet::new(&pose, scale);
-            let t = std::time::Instant::now();
-            for _ in 0..300 {
-                pm.fill(Color::TRANSPARENT);
-                draw(&pose, &feet, scale, &mut pm, (0, 0));
-            }
-            println!("scale {scale}: {size}px window, {:.2} ms per frame", t.elapsed().as_secs_f64() * 1000.0 / 300.0);
+            let mut cache = Cache::new(scale, 0.0);
+            let (mut relights, mut lit) = (0, cache.heading);
+            let mut time = |cached: bool| {
+                let mut walker = crate::path::Walker::new();
+                let s = walker.step(0.0);
+                let mut feet = Feet::new(&FlyPose { x: 0.0, y: 0.0, heading: s.heading, speed: 0.0, gait_phase: s.gait_phase }, scale);
+                let (mut spent, mut frames) = (std::time::Duration::ZERO, 0);
+                for _ in 0..60 * 60 {
+                    let s = walker.step(1.0 / 60.0);
+                    let pose = FlyPose { x: s.x * scale, y: s.y * scale, heading: s.heading, speed: s.speed, gait_phase: s.gait_phase };
+                    feet.update(&pose, scale);
+                    if s.speed == 0.0 {
+                        continue; // stopped: the app skips these frames
+                    }
+                    let origin = (pose.x.floor() as i32 - size / 2, pose.y.floor() as i32 - size / 2);
+                    let t = std::time::Instant::now();
+                    pm.fill(Color::TRANSPARENT);
+                    if cached {
+                        cache.draw(&pose, &feet, scale, &mut pm, origin);
+                        relights += (cache.heading != lit) as u32;
+                        lit = cache.heading;
+                    } else {
+                        draw(&pose, &feet, scale, &mut pm, origin);
+                    }
+                    spent += t.elapsed();
+                    frames += 1;
+                }
+                spent.as_secs_f64() * 1000.0 / frames as f64
+            };
+            let (v, c) = (time(false), time(true));
+            let kb = (cache.rigid.data().len() + cache.shadow.data().len()) as f64 / 1024.0;
+            println!("scale {scale}: {size}px window, vector {v:.2} ms, cached {c:.3} ms per frame ({relights} relights/min), cache {kb:.0} KiB");
         }
     }
 }
