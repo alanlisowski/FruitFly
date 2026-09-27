@@ -41,6 +41,7 @@ DEFAULTS = {
     "w_epg_pfl3": 18, "w_pfl3_dn": 14,
     "w_epg_pfl2": 14, "w_pfl2_dn": 30,
     "w_loom_turn": 14,
+    "w_contact_dn": 20,
 }
 
 # Same conversion the real extractor uses, so stub weights and measured weights
@@ -227,6 +228,20 @@ def build(P=None):
     # ---- grooming --------------------------------------------------------
     dng11 = [add("DNg11", s, "ACH", "descending") for s in ("left", "right")]
 
+    # ---- touch -----------------------------------------------------------
+    # CONTACT stands in for mechanosensory input (antennae, legs) reporting an edge within
+    # reach on one side. Each side excites its own DNa02, so the fly turns toward what it
+    # touches; crossing the edge moves it to the other side and turns the fly back. That weave
+    # is the edge following. Appended last, so no existing neuron index changes.
+    contact_l = [add("CONTACT", "left", "ACH", "mechanosensory") for _ in range(4)]
+    contact_r = [add("CONTACT", "right", "ACH", "mechanosensory") for _ in range(4)]
+    for c in contact_l:
+        for d in dna02_l:
+            connect(c, d, P["w_contact_dn"])
+    for c in contact_r:
+        for d in dna02_r:
+            connect(c, d, P["w_contact_dn"])
+
     motor = defaultdict(lambda: {"left": [], "right": [], "other": []})
 
     def tag(role, left, right, other=()):
@@ -249,6 +264,8 @@ def build(P=None):
         "ring_visual": er,
         "HSE_left": hs_l,
         "HSE_right": hs_r,
+        "CONTACT_left": contact_l,
+        "CONTACT_right": contact_r,
         "EPG": [i for w in epg for i in w],
     }
 

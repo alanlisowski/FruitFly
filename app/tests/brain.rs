@@ -150,12 +150,13 @@ fn empty_groups_read_zero() {
 #[test]
 fn pack_loads_and_rejects_garbage() {
     let p = Pack::parse(STUB).unwrap();
-    assert_eq!(p.n, 204);
+    let word = |i: usize| u32::from_le_bytes(STUB[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+    assert_eq!(p.n, word(1));
     assert_ne!((16 + u32::from_le_bytes(STUB[12..16].try_into().unwrap())) % 4, 0, "stub no longer tests alignment");
     assert!(Pack::parse(&STUB[..STUB.len() - 1]).is_err());
     assert!(Pack::parse(b"FBP0").is_err());
     let mut bad = STUB.to_vec();
-    let last = bad.len() - 4 * 2016 - 4; // last index entry -> out of range
+    let last = bad.len() - 4 * word(2) - 4; // last index entry -> out of range
     bad[last..last + 4].copy_from_slice(&9999u32.to_le_bytes());
     assert!(Pack::parse(&bad).is_err());
 }

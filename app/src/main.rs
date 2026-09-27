@@ -6,6 +6,7 @@ mod body;
 mod fly;
 mod path;
 mod snapshot;
+mod world;
 
 use body::Body;
 use flit::brain::{Brain, Pack};
@@ -239,8 +240,10 @@ enum Driver {
         body: Body,
         /// Brain time owed to the clock, ms (< 1 after each frame).
         owed_ms: f32,
-        /// `--debug`: (brain ms, spikes) since the last print.
-        debug: Option<(u32, usize)>,
+        /// `--debug`: (brain ms, spikes) since the last print, prints so far.
+        debug: Option<(u32, usize, u32)>,
+        /// Window edges and the work-area border, as of the last poll.
+        world: world::World,
     },
     Demo(path::Walker, path::Step),
 }
@@ -252,16 +255,12 @@ impl Driver {
 
     fn advance(&mut self, dt: f32, scale: f32) {
         match self {
-            Driver::Brain { brain, body, owed_ms, debug } => {
+            Driver::Brain { brain, body, owed_ms, debug, world } => {
                 *owed_ms += dt * 1000.0;
                 let steps = (*owed_ms as u32).min(Self::MAX_STEPS);
                 *owed_ms = (*owed_ms - steps as f32).min(0.999);
-                let mut spikes = 0;
-                for _ in 0..steps {
-                    spikes += brain.step();
-                }
-                body.update(brain, steps as f32, scale, on_work_area, work_area_centre);
-                if let Some((ms, n)) = debug {
+                let spikes = body.tick(brain, steps, scale, &world.segs, on_work_area, work_area_centre);
+                if let Some((ms, n, prints)) = debug {
                     (*ms, *n) = (*ms + steps, *n + spikes);
                     if *ms >= 500 {
                         let (angle, mag) = brain.bump();
@@ -273,7 +272,17 @@ impl Driver {
                             mag,
                             *n as f32 * 1000.0 / *ms as f32
                         );
-                        (*ms, *n) = (0, 0);
+                        (*ms, *n, *prints) = (0, 0, *prints + 1);
+                        if *prints % 2 == 0 {
+                            println!(
+                                "  world: {} windows, {} segments, poll {:.2} ms, contact L {:.2} R {:.2}",
+                                world.rects.len(),
+                                world.segs.len(),
+                                world.poll_ms,
+                                body.contact.0,
+                                body.contact.1
+                            );
+                        }
                     }
                 }
             }
@@ -306,7 +315,7 @@ fn main() {
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    if flag("--debug") || flag("--pack") || flag("--walk-speed") {
+    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -348,6 +357,28 @@ fn main() {
     // told (WM_DPICHANGED) when the window crosses to a monitor with a different scale.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
         .expect("SetProcessDpiAwarenessContext");
+
+    // `--dump-world <png>`: what the fly would feel right now, drawn, then exit. After the DPI
+    // call, so rects are in physical pixels like everything else.
+    if let Some(i) = args.iter().position(|a| a == "--dump-world") {
+        let Some(path) = args.get(i + 1) else {
+            eprintln!("flit: --dump-world needs a .png path");
+            std::process::exit(1);
+        };
+        let w = world::poll(HWND::default());
+        println!("{} windows, {} segments, poll {:.2} ms", w.rects.len(), w.segs.len(), w.poll_ms);
+        for (r, h) in w.rects.iter().zip(&w.hwnds) {
+            println!("  window {:6} {:6} {:6} {:6}  {}", r.l, r.t, r.r, r.b, world::describe(*h));
+        }
+        for s in &w.segs {
+            println!("  seg ({:6}, {:6}) - ({:6}, {:6})", s.a.0, s.a.1, s.b.0, s.b.1);
+        }
+        if let Err(e) = world::dump(&w, path.as_ref()) {
+            eprintln!("flit: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Tray icon first: it's our only way out. tray-icon makes its own hidden window on this
     // thread, so it works as long as our loop below keeps dispatching messages.
@@ -407,10 +438,10 @@ fn main() {
     } else {
         let mut brain = Brain::new(pack, 1);
         brain.warmup(3, 16);
-        let debug = flag("--debug").then_some((0, 0));
+        let debug = flag("--debug").then_some((0, 0, 0));
         let mut body = Body::new(work_area_centre(0.0, 0.0));
         body.walk = walk;
-        Driver::Brain { brain, body, owed_ms: 0.0, debug }
+        Driver::Brain { brain, body, owed_ms: 0.0, debug, world: world::poll(hwnd) }
     };
     let mut pose = driver.pose(scale);
     let mut feet = Feet::new(&pose, scale);
@@ -425,6 +456,9 @@ fn main() {
     // so it needs no extra wake-ups: a 1 ms sleep here would cost ~1% of a core at rest.
     let mut clock = Clock { last: Instant::now(), paused: false };
     let mut next_frame = clock.last;
+    // The desktop is polled at 10 Hz, not every frame: windows move slowly next to a fly.
+    const POLL: Duration = Duration::from_millis(100);
+    let mut next_poll = clock.last + POLL;
     let mut msg = Default::default();
     'main: loop {
         // SAFETY: `msg` is a valid MSG out-param; PeekMessage (non-blocking) fills it.
@@ -469,6 +503,12 @@ fn main() {
         }
 
         let now = Instant::now();
+        if now >= next_poll {
+            if let Driver::Brain { world, .. } = &mut driver {
+                *world = world::poll(hwnd);
+            }
+            next_poll = now + POLL;
+        }
         if now >= next_frame {
             // Motion is driven by real elapsed running time, not by counting frames, so a
             // dropped frame doesn't change the fly's speed (see `Clock`).
@@ -531,7 +571,7 @@ mod tests {
     fn brain_driver() -> Driver {
         let mut brain = Brain::new(Pack::parse(flit::brain::STUB).unwrap(), 1);
         brain.warmup(3, 16);
-        Driver::Brain { brain, body: Body::new(work_area_centre(0.0, 0.0)), owed_ms: 0.0, debug: None }
+        Driver::Brain { brain, body: Body::new(work_area_centre(0.0, 0.0)), owed_ms: 0.0, debug: None, world: world::World::default() }
     }
 
     /// Five simulated minutes on this machine's real monitors at 60 Hz: the pose stays finite

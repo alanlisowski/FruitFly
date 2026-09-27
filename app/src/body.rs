@@ -3,11 +3,22 @@
 //! standing in for the ventral nerve cord the brain doesn't have.
 
 use crate::fly::{CYCLE, FLY_SCALE, FlyPose, SPEED_SCALE, WALK_SPEED};
+use crate::world::{self, Seg};
 use flit::brain::Brain;
 use std::f32::consts::PI;
 
 /// Gait phase at distance 0 (all six feet down), as in `path.rs`.
 const REST_PHASE: f64 = 0.45;
+/// mV injected into each CONTACT neuron per frame's brain step, at full contact (1.0).
+const CONTACT_MV: f32 = 30.0;
+/// The work-area wall keeps the thorax this far inside it, in body units.
+const WALL: f32 = 6.0;
+/// Pressed into the wall this long without getting anywhere (a corner, or walking straight
+/// into it), the fly turns away.
+const STUCK_MS: f32 = 1000.0;
+/// ...and keeps turning this long. A one-frame turn doesn't last: the brain holds its heading
+/// (PFL3) and steers straight back into the wall.
+const UNSTICK_MS: f32 = 600.0;
 
 pub struct Body {
     /// Physical screen pixels.
@@ -23,11 +34,41 @@ pub struct Body {
     walked: f64,
     /// Multiplier on the forward-command walking speed (`--walk-speed`); escape is unaffected.
     pub walk: f32,
+    /// Last frame's contact (left, right), 0..1, for `--debug`.
+    pub contact: (f32, f32),
+    /// How long the fly has been blocked by the work-area wall, and how long it has left to
+    /// turn away from it.
+    stuck_ms: f32,
+    unstick_ms: f32,
 }
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, contact: (0.0, 0.0), stuck_ms: 0.0, unstick_ms: 0.0 }
+    }
+
+    /// One frame: feel `segs`, hold that contact for all `steps` brain steps (injected into the
+    /// CONTACT neurons like looming is), then move. Returns the spike count.
+    pub fn tick(
+        &mut self,
+        brain: &mut Brain,
+        steps: u32,
+        scale: f32,
+        segs: &[Seg],
+        inside: impl Fn(f32, f32) -> bool,
+        home: impl Fn(f32, f32) -> (f32, f32),
+    ) -> usize {
+        self.contact = world::contact(self.x, self.y, self.heading, world::REACH * FLY_SCALE * scale, segs);
+        let left = brain.pack.sensory("CONTACT_left").to_vec();
+        let right = brain.pack.sensory("CONTACT_right").to_vec();
+        let mut spikes = 0;
+        for _ in 0..steps {
+            brain.inject(&left, CONTACT_MV * self.contact.0);
+            brain.inject(&right, CONTACT_MV * self.contact.1);
+            spikes += brain.step();
+        }
+        self.update(brain, steps as f32, scale, inside, home);
+        spikes
     }
 
     /// Advances `dt_ms` of brain time. `inside(x, y)`: is this screen point on some monitor's
@@ -77,24 +118,32 @@ impl Body {
         self.x += self.heading.cos() * step * scale;
         self.y += self.heading.sin() * step * scale;
 
-        // TEMPORARY (milestone 4): keep a margin of work area around the fly on every side, per
-        // axis (so it slides along an edge), turn it toward the middle of its monitor, and feed
-        // that turn to the PENs so the brain's heading estimate agrees with the body. Real
-        // edge-following through the circuit replaces this.
+        // The work-area border is a hard wall (window edges are sensed and crossable; following
+        // any edge is the brain's job, see `tick`). Blocked, the fly slides along the wall, per
+        // axis. Still getting nowhere after STUCK_MS (a corner, or walking straight into it),
+        // it turns toward the middle of its monitor and feeds that turn to the PENs, so the
+        // brain's heading estimate agrees with the body.
         if !inside(self.x, self.y) {
             (self.x, self.y) = home(self.x, self.y); // monitor unplugged, taskbar moved...
         }
-        let m = 30.0 * FLY_SCALE * scale;
-        let mut bounced = false;
+        let m = WALL * FLY_SCALE * scale;
+        let mut blocked = false;
         if !inside(self.x - m, self.y) || !inside(self.x + m, self.y) {
             self.x = old_x;
-            bounced = true;
+            blocked = true;
         }
         if !inside(self.x, self.y - m) || !inside(self.x, self.y + m) {
             self.y = old_y;
-            bounced = true;
+            blocked = true;
         }
-        if bounced {
+        let moved = (self.x - old_x).hypot(self.y - old_y);
+        let stuck = blocked && moved < 0.3 * step * scale;
+        self.stuck_ms = if stuck { self.stuck_ms + dt_ms } else { 0.0 };
+        if self.stuck_ms > STUCK_MS {
+            self.unstick_ms = UNSTICK_MS;
+        }
+        self.unstick_ms = (self.unstick_ms - dt_ms).max(0.0);
+        if self.unstick_ms > 0.0 {
             let (hx, hy) = home(self.x, self.y);
             let inward = (hy - self.y).atan2(hx - self.x);
             let diff = (inward - self.heading).sin().atan2((inward - self.heading).cos());
@@ -165,5 +214,132 @@ mod tests {
             fleeing / cycle_px
         );
         assert!(hz <= 8.0, "legs step {hz:.1} times a second while walking");
+    }
+
+    // --- Edge following, closed loop: brain + body + fixed segments, at 100% -----------------
+
+    use crate::world::{BODY_LENGTH, Rect, border};
+
+    /// One body length in px at 100%.
+    const BL: f32 = BODY_LENGTH * FLY_SCALE;
+
+    /// Runs a fly from `(x, y, heading)` among `segs`, walled in by `work`, 60 Hz frames of 16
+    /// brain steps, until `each(body, seconds)` returns Some(verdict) or `secs` run out (false).
+    fn trial(pack: &[u8], seed: u64, start: (f32, f32, f32), segs: &[Seg], work: Rect, secs: f32, mut each: impl FnMut(&Body, f32) -> Option<bool>) -> bool {
+        let mut brain = Brain::new(Pack::parse(pack).unwrap(), seed);
+        brain.warmup(3, 16);
+        let mut body = Body::new((start.0, start.1));
+        body.heading = start.2;
+        let inside = |x: f32, y: f32| x >= work.l && x < work.r && y >= work.t && y < work.b;
+        let home = |_: f32, _: f32| ((work.l + work.r) / 2.0, (work.t + work.b) / 2.0);
+        for f in 0..(secs * 60.0) as u32 {
+            body.tick(&mut brain, 16, 1.0, segs, inside, home);
+            if let Some(v) = each(&body, f as f32 / 60.0) {
+                return v;
+            }
+        }
+        false
+    }
+
+    const FAR: Rect = Rect { l: -1e5, t: -1e5, r: 1e5, b: 1e5 };
+    /// A window edge along y = 0, crossable.
+    const EDGE: [Seg; 1] = [Seg { a: (-1e5, 0.0), b: (1e5, 0.0) }];
+
+    /// Meets the edge at a shallow angle, starting where it first feels it: after first coming
+    /// within 1 BL, it must travel 8 BL without straying more than ~1 BL (1.2) from the line,
+    /// crossing it at least twice.
+    fn follows_edge(pack: &[u8], seed: u64, deg: f32) -> bool {
+        let y0 = crate::world::REACH * FLY_SCALE;
+        let (mut on, mut path, mut crossings, mut prev) = (false, 0.0, 0, (0.0_f32, y0));
+        trial(pack, seed, (0.0, y0, -deg.to_radians()), &EDGE, FAR, 40.0, |b, _| {
+            let step = (b.x - prev.0).hypot(b.y - prev.1);
+            crossings += (on && b.y.signum() != prev.1.signum()) as u32;
+            prev = (b.x, b.y);
+            on |= b.y.abs() < BL;
+            if !on {
+                return None;
+            }
+            if b.y.abs() > 1.2 * BL {
+                return Some(false);
+            }
+            path += step;
+            (path >= 8.0 * BL).then_some(crossings >= 2)
+        })
+    }
+
+    /// Meets the edge nearly head-on: must cross and carry on 2 BL beyond it.
+    fn crosses_edge(pack: &[u8], seed: u64) -> bool {
+        trial(pack, seed, (0.0, 2.0 * BL, -85f32.to_radians()), &EDGE, FAR, 10.0, |b, _| (b.y < -2.0 * BL).then_some(true))
+    }
+
+    /// Walks parallel to the bottom screen border, 10 px inside: must travel 8 BL along it
+    /// without getting more than 1 BL away.
+    fn follows_border(pack: &[u8], seed: u64) -> bool {
+        let work = Rect { l: -1e5, t: -1e5, r: 1e5, b: 0.0 };
+        let (mut path, mut prev) = (0.0, (0.0_f32, -10.0_f32));
+        trial(pack, seed, (0.0, -10.0, 0.0), &border(&[work]), work, 40.0, |b, _| {
+            path += (b.x - prev.0).hypot(b.y - prev.1);
+            prev = (b.x, b.y);
+            if b.y < -BL {
+                return Some(false);
+            }
+            (path >= 8.0 * BL).then_some(true)
+        })
+    }
+
+    /// Starts in the bottom-left corner of a screen, facing into it: must get 2 BL away from
+    /// the corner within 3 s.
+    fn leaves_corner(pack: &[u8], seed: u64) -> bool {
+        let work = Rect { l: 0.0, t: 0.0, r: 1200.0, b: 800.0 };
+        let start = (10.0, 790.0, 135f32.to_radians());
+        trial(pack, seed, start, &border(&[work]), work, 3.0, |b, _| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
+    }
+
+    /// Passes out of 6 seeds for each scenario: shallow 20 deg, shallow 30 deg, steep, border,
+    /// corner.
+    fn score(pack: &[u8]) -> [u32; 5] {
+        let count = |f: &dyn Fn(u64) -> bool| (1..=6).filter(|&s| f(s)).count() as u32;
+        [
+            count(&|s| follows_edge(pack, s, 20.0)),
+            count(&|s| follows_edge(pack, s, 30.0)),
+            count(&|s| crosses_edge(pack, s)),
+            count(&|s| follows_border(pack, s)),
+            count(&|s| leaves_corner(pack, s)),
+        ]
+    }
+
+    /// The acceptance bar on the shipped stub pack: follow at shallow angles and along the
+    /// border (5/6), usually cross head-on (4/6), get out of corners (5/6).
+    #[test]
+    fn edge_following() {
+        let s = score(STUB);
+        println!("shallow 20 {}/6, shallow 30 {}/6, steep {}/6, border {}/6, corner {}/6", s[0], s[1], s[2], s[3], s[4]);
+        assert!(s[0] >= 5 && s[1] >= 5, "shallow edges not followed: {s:?}");
+        assert!(s[2] >= 4, "head-on edges not crossed: {s:?}");
+        assert!(s[3] >= 5, "border not followed: {s:?}");
+        assert!(s[4] >= 5, "stuck in corners: {s:?}");
+    }
+
+    /// The CONTACT weight sweep. Packs come from `extract/make_stub_pack.py` with
+    /// `w_contact_dn` overridden, named `w<weight>.fbp`, in the directory `FLIT_SWEEP`. Run:
+    /// `FLIT_SWEEP=<dir> cargo test --release sweep_contact -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sweep_contact() {
+        let dir = std::env::var("FLIT_SWEEP").expect("FLIT_SWEEP=<dir of w*.fbp>");
+        let mut packs: Vec<(f32, std::path::PathBuf)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                Some((p.file_stem()?.to_str()?.strip_prefix('w')?.parse().ok()?, p))
+            })
+            .collect();
+        packs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        println!("| w_contact_dn | shallow 20 | shallow 30 | steep crosses | border | corner |");
+        println!("|---|---|---|---|---|---|");
+        for (w, p) in packs {
+            let s = score(&std::fs::read(p).unwrap());
+            println!("| {w} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 |", s[0], s[1], s[2], s[3], s[4]);
+        }
     }
 }
