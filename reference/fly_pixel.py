@@ -140,8 +140,8 @@ def two_bone(ax, ay, fx, fy, l1, l2):
 # attach (x, |y|), rest foot (x, |y|), femur, tibia   -- measured off the chosen image
 LEGS = [
     ((2.8, 6.6), (9.8, 16.2), 7.2, 7.6),     # front: up and out
-    ((-0.8, 7.2), (-5.4, 19.2), 6.6, 7.4),   # middle: straight out
-    ((-7.6, 3.6), (-20.2, 13.4), 8.4, 9.6),  # hind: back and down
+    ((-0.8, 7.2), (-5.4, 19.2), 7.4, 8.2),   # middle: straight out
+    ((-7.6, 3.6), (-20.2, 13.4), 9.2, 10.4),  # hind: back and down
 ]
 
 

@@ -2,7 +2,7 @@
 //! a scale factor plus a first-order lag, nothing more; the one exception is the escape latch,
 //! standing in for the ventral nerve cord the brain doesn't have.
 
-use crate::fly::{CYCLE, FLY_SCALE, FlyPose};
+use crate::fly::{CYCLE, FLY_SCALE, FlyPose, SPEED_SCALE};
 use flit::brain::Brain;
 use std::f32::consts::PI;
 
@@ -61,6 +61,7 @@ impl Body {
         if startled {
             target_speed += 0.52; // ponytail: the web client's wing buzz isn't drawn; add with wing animation
         }
+        target_speed *= SPEED_SCALE; // the web client's gains are for the FLY_SCALE = 1.9 fly
 
         // First-order lag stands in for leg and body inertia.
         let k = 1.0 - (-dt_ms / 55.0).exp();
@@ -109,5 +110,58 @@ impl Body {
             speed: self.speed * 1000.0 * scale,
             gait_phase: (REST_PHASE + self.walked / (FLY_SCALE * CYCLE) as f64).rem_euclid(1.0) as f32,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flit::brain::{Pack, STUB};
+
+    /// Runs the brain-driven body for `frames` 60 Hz frames at 100% (16 brain steps each),
+    /// calling `stim(brain, ms)` before every step. Returns each frame's speed in logical px/s.
+    fn run(brain: &mut Brain, body: &mut Body, frames: u32, mut stim: impl FnMut(&mut Brain, u32)) -> Vec<f32> {
+        let mut ms = 0;
+        (0..frames)
+            .map(|_| {
+                for _ in 0..16 {
+                    stim(brain, ms);
+                    brain.step();
+                    ms += 1;
+                }
+                body.update(brain, 16.0, 1.0, |_, _| true, |x, y| (x, y));
+                body.speed * 1000.0
+            })
+            .collect()
+    }
+
+    /// Legs must step slowly enough to see at 60 fps: step frequency = speed / px per gait
+    /// cycle, at the brain's typical forward command. Escape is printed, not asserted (a
+    /// fleeing fly's legs may blur).
+    #[test]
+    fn steps_slow_enough_to_see() {
+        let cycle_px = CYCLE * FLY_SCALE;
+        let mut brain = Brain::new(Pack::parse(STUB).unwrap(), 1);
+        brain.warmup(3, 16);
+        let mut body = Body::new((0.0, 0.0));
+        run(&mut brain, &mut body, 120, |_, _| {}); // settle
+        let walk = run(&mut brain, &mut body, 300, |_, _| {});
+        let walking = walk.iter().sum::<f32>() / walk.len() as f32;
+
+        let (lplc2, lc4) = (brain.pack.sensory("LPLC2").to_vec(), brain.pack.sensory("LC4").to_vec());
+        let escape = run(&mut brain, &mut body, 60, |b, ms| {
+            if ms < 300 {
+                let drive = 16.0 * (ms as f32 / 300.0).powi(2);
+                b.inject(&lplc2, drive);
+                b.inject(&lc4, drive * 0.7);
+            }
+        });
+        let fleeing = escape.iter().cloned().fold(0.0, f32::max);
+        let hz = walking / cycle_px;
+        println!(
+            "walking {walking:.0} px/s -> {hz:.1} steps/s; escape peak {fleeing:.0} px/s -> {:.1} steps/s ({cycle_px:.2} px per cycle)",
+            fleeing / cycle_px
+        );
+        assert!(hz <= 15.0, "legs step {hz:.1} times a second while walking");
     }
 }

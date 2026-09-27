@@ -1,7 +1,8 @@
 # flit
 
-A procedural pixel-art fruit fly that walks a figure-eight over your windows. Click-through,
-always on top, quit from the tray. No brain yet: the route is hardcoded (`path.rs`).
+A procedural pixel-art fruit fly that walks over your windows. Click-through,
+always on top, quit from the tray. A spiking brain (`brain.rs`) drives it; `--demo-path` swaps in
+the old hardcoded route (`path.rs`).
 
 ```
 cargo run --release

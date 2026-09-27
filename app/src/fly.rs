@@ -7,6 +7,9 @@
 
 /// Reference `FLY_SCALE`: ~60 px across the legs at 100% display scale.
 pub const FLY_SCALE: f32 = 1.3;
+/// Multiplies every body speed (walking, escape, demo route). Speeds were tuned for the
+/// FLY_SCALE = 1.9 fly; scaling them with the fly keeps the same body lengths per second.
+pub const SPEED_SCALE: f32 = FLY_SCALE / 1.9;
 
 // --- Gait ---------------------------------------------------------------------------------
 // One gait cycle per leg = STANCE (foot on the ground, moving backward relative to the body)
@@ -17,7 +20,7 @@ const SWING: f32 = 1.0 - STANCE;
 /// How far (body units) a planted foot travels backward relative to the body per step.
 /// The largest round value at which no legs cross at ANY gait phase and every foot stays in
 /// reach (`legs_never_cross_and_never_stretch` in art.rs, `feet_stay_within_reach`).
-const STRIDE: f32 = 3.0;
+const STRIDE: f32 = 2.0;
 /// Peak lift of a swinging foot, drawn as a sideways offset (we look from above).
 const LIFT: f32 = 1.2;
 /// Distance the body walks per full gait cycle. A foot stays put on the ground for the whole
@@ -61,10 +64,12 @@ pub struct FlyPose {
 }
 
 /// Reference `LEGS`: attach (x, |y|), rest foot (x, |y|), femur, tibia. Front, middle, hind.
+/// Middle and hind bones are longer than the reference image's, so the rest foot isn't near
+/// full reach and there's room for a stride.
 pub const LEGS: [((f32, f32), (f32, f32), f32, f32); 3] = [
     ((2.8, 6.6), (9.8, 16.2), 7.2, 7.6),
-    ((-0.8, 7.2), (-5.4, 19.2), 6.6, 7.4),
-    ((-7.6, 3.6), (-20.2, 13.4), 8.4, 9.6),
+    ((-0.8, 7.2), (-5.4, 19.2), 7.4, 8.2),
+    ((-7.6, 3.6), (-20.2, 13.4), 9.2, 10.4),
 ];
 
 /// Foot index `k` (0..6): 0..3 = left side (y < 0) front..back, 3..6 = right side.
@@ -195,7 +200,7 @@ impl Feet {
 #[cfg(test)]
 pub fn walk(scale: f32, radius: f32, steps: usize, mut each: impl FnMut(&FlyPose, &Feet)) {
     let unit = FLY_SCALE * scale;
-    let step = 2.0 * scale; // px per step
+    let step = 2.0 * SPEED_SCALE * scale; // px per step
     let mut pose = FlyPose { x: 500.0, y: 500.0, heading: 0.0, speed: 1.0, gait_phase: 0.45 };
     let mut feet = Feet::new(&pose, scale);
     for _ in 0..steps {
@@ -229,9 +234,7 @@ mod tests {
                             assert!(d < 0.01, "foot {i} slid {d} px");
                         }
                         let j = (ppos[i].0 - pos[i].0).hypot(ppos[i].1 - pos[i].1);
-                        // a swinging foot outruns the body by ~2.3x at mid-swing; walk() steps 2 px
-                        let limit = 3.0 * 2.0 / FLY_SCALE;
-                        assert!(j < limit, "foot {i} jumped {j} units (limit {limit})");
+                        assert!(j < 4.0, "foot {i} jumped {j} units");
                     }
                 }
                 prev = Some((planted, pos, world));

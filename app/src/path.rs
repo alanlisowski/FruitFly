@@ -4,7 +4,7 @@
 //! *logical* pixels (96 dpi); `main` scales to physical pixels, so a DPI change never
 //! changes where the fly is along its route or how fast it walks.
 
-use crate::fly::{CYCLE, FLY_SCALE};
+use crate::fly::{CYCLE, FLY_SCALE, SPEED_SCALE};
 use std::f64::consts::TAU;
 
 // Figure-eight (lemniscate of Gerono): x = A sin t, y = (B/2) sin 2t. 600 wide, 100 tall each side.
@@ -16,8 +16,9 @@ const CYCLE_PX: f64 = (FLY_SCALE * CYCLE) as f64;
 /// Gait phase at distance 0: the middle of the window where all six feet are on the ground.
 const REST_PHASE: f64 = 0.45;
 
-const ACCEL: f64 = 300.0; // px/s^2, used for speeding up from and braking to a stop
-const START_SPEED: f64 = 12.0; // px/s: the fly never starts from exactly 0 (sqrt(0) would stall)
+const SPEED: f64 = SPEED_SCALE as f64;
+const ACCEL: f64 = 300.0 * SPEED; // px/s^2, used for speeding up from and braking to a stop
+const START_SPEED: f64 = 12.0 * SPEED; // px/s: the fly never starts from exactly 0 (sqrt(0) would stall)
 const DWELL: f32 = 1.8; // seconds standing still, once per lap
 
 /// One frame's worth of output, still in logical units relative to the route's centre.
@@ -92,9 +93,9 @@ impl Walker {
             }
             self.speed = 0.0;
         } else {
-            // Slow/fast sections: two slow-fast waves per lap, 30..230 px/s.
+            // Slow/fast sections: two slow-fast waves per lap, 30..230 px/s before SPEED.
             let u = self.d.rem_euclid(self.lap()) / self.lap();
-            let cruise = 130.0 + 100.0 * (TAU * 2.0 * u).sin();
+            let cruise = (130.0 + 100.0 * (TAU * 2.0 * u).sin()) * SPEED;
             // Never faster than we can brake to the next stop, or than we can have sped up.
             let brake = (2.0 * ACCEL * (self.stop - self.d)).max(0.0).sqrt();
             let launch = START_SPEED + (2.0 * ACCEL * (self.d - self.leave)).sqrt();
