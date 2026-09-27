@@ -5,8 +5,8 @@
 //! Body space (same as the reference drawing): the fly faces +x, y points down (so +y is the
 //! fly's right), 1 unit = 1 px at 100% display scale *before* `FLY_SCALE`.
 
-/// Reference `FLY_SCALE`: ~70 px nose to wingtip at 100% display scale ("medium").
-pub const FLY_SCALE: f32 = 1.9;
+/// Reference `FLY_SCALE`: ~60 px across the legs at 100% display scale.
+pub const FLY_SCALE: f32 = 1.3;
 
 // --- Gait ---------------------------------------------------------------------------------
 // One gait cycle per leg = STANCE (foot on the ground, moving backward relative to the body)
@@ -15,11 +15,9 @@ pub const FLY_SCALE: f32 = 1.9;
 const STANCE: f32 = 0.6;
 const SWING: f32 = 1.0 - STANCE;
 /// How far (body units) a planted foot travels backward relative to the body per step.
-/// (The reference's `stride=+-3` stand-in is a similar range, -3..+3.) 5 is the largest round
-/// value at which no legs cross at ANY gait phase: at 6 a same-side front and middle leg form
-/// an X for a third of the cycle, because with 60% stance the two tripods aren't mirror images
-/// mid-step. `legs_never_cross_and_never_stretch` in art.rs guards it.
-const STRIDE: f32 = 5.0;
+/// The largest round value at which no legs cross at ANY gait phase and every foot stays in
+/// reach (`legs_never_cross_and_never_stretch` in art.rs, `feet_stay_within_reach`).
+const STRIDE: f32 = 3.0;
 /// Peak lift of a swinging foot, drawn as a sideways offset (we look from above).
 const LIFT: f32 = 1.2;
 /// Distance the body walks per full gait cycle. A foot stays put on the ground for the whole
@@ -28,15 +26,22 @@ const LIFT: f32 = 1.2;
 pub const CYCLE: f32 = STRIDE / STANCE;
 
 /// Farthest any painted pixel can be from the fly's centre, in body units, at any heading and
-/// gait phase: legs at full stretch (~27 incl. tarsus and outline), wings (~25), and the
-/// shadow (~32 to where it fades to nothing, see `art::draw_shadow`). Sizes the window;
-/// `fits_in_window` proves it by rendering.
-const RADIUS: f32 = 33.0;
+/// gait phase: measured 26.0 (hind legs at full stretch, round feet and outline), plus a margin.
+/// Sizes the window; `fits_in_window` proves it by rendering.
+const RADIUS: f32 = 27.5;
 
-/// Window edge length in physical pixels for a given DPI scale (dpi / 96).
-/// Even, so the centre is a whole pixel, plus a small margin for anti-aliasing.
+/// Screen pixels per art pixel: whole pixels only, so 1 at 100-175%, 2 at 200-275%.
+pub fn art_px(scale: f32) -> u32 {
+    ((scale + 1e-6).floor() as u32).max(1)
+}
+
+/// Window edge length in physical pixels for a given DPI scale (dpi / 96): a whole, even number
+/// of art pixels (so the fly's centre sits on an art-grid line), plus one art pixel of margin
+/// each side.
 pub fn window_size(scale: f32) -> i32 {
-    ((2.0 * RADIUS * FLY_SCALE * scale).ceil() as i32 + 4 + 1) & !1
+    let ap = art_px(scale);
+    let art = ((2.0 * RADIUS * FLY_SCALE * scale / ap as f32).ceil() as u32 + 2 + 1) & !1;
+    (art * ap) as i32
 }
 
 /// Where the fly is and how its legs are. Everything the drawing needs, nothing it doesn't.
@@ -55,12 +60,11 @@ pub struct FlyPose {
     pub gait_phase: f32,
 }
 
-/// Reference `LEGS`: attach x, |attach y|, direction from forward axis (deg), femur, tibia,
-/// tarsus. Front, middle, back.
-pub const LEGS: [(f32, f32, f32, f32, f32, f32); 3] = [
-    (7.5, 5.4, 44.0, 7.0, 7.4, 4.0),
-    (3.5, 7.0, 94.0, 7.4, 8.2, 4.2),
-    (-0.5, 6.4, 140.0, 8.2, 9.4, 4.6),
+/// Reference `LEGS`: attach (x, |y|), rest foot (x, |y|), femur, tibia. Front, middle, hind.
+pub const LEGS: [((f32, f32), (f32, f32), f32, f32); 3] = [
+    ((2.8, 6.6), (9.8, 16.2), 7.2, 7.6),
+    ((-0.8, 7.2), (-5.4, 19.2), 6.6, 7.4),
+    ((-7.6, 3.6), (-20.2, 13.4), 8.4, 9.6),
 ];
 
 /// Foot index `k` (0..6): 0..3 = left side (y < 0) front..back, 3..6 = right side.
@@ -84,21 +88,17 @@ pub struct LegGeo {
 
 pub fn leg_geo(k: usize) -> LegGeo {
     let (side, i) = (side_of(k), k % 3);
-    let (ax, ay, deg, f, t, _) = LEGS[i];
+    let ((ax, ay), (fx, fy), f, t) = LEGS[i];
     let attach = (ax, ay * side);
-    let th = deg.to_radians();
-    let dir = (th.cos(), th.sin() * side);
     let full = f + t;
-    // Neutral foot spot: 90% of full reach along the leg's direction, as in the reference.
-    let neutral = (attach.0 + dir.0 * 0.90 * full, attach.1 + dir.1 * 0.90 * full);
-    // The reference's stand-in stride of +-3 around that spot overshoots full reach on the
-    // front and back legs (they'd have to stretch). Legs here have FIXED segment lengths, so
-    // slide the stride window along x, only as far as needed, until both ends of the stride
-    // are within 98% of full reach. (Shrinking the neutral spot instead bends the knees more
-    // and makes same-side legs cross sooner.)
+    // Neutral foot spot: the reference's rest foot. A stride around it can overshoot full reach
+    // (legs here have FIXED segment lengths), so slide the stride window along x, only as far as
+    // needed, until both ends of the stride are within 98% of full reach.
+    let neutral = (fx, fy * side);
+    let (dx, dy) = (fx - ax, fy - ay);
     let h = STRIDE / 2.0;
-    let root = ((0.98 * full).powi(2) - (0.90 * full * dir.1).powi(2)).sqrt(); // max |x| from the hip
-    let (lo, hi) = (0.90 * full * dir.0 - h, 0.90 * full * dir.0 + h);
+    let root = ((0.98 * full).powi(2) - dy * dy).max(0.0).sqrt(); // max |x| from the hip
+    let (lo, hi) = (dx - h, dx + h);
     let shift = if hi > root { root - hi } else if lo < -root { -root - lo } else { 0.0 };
     let phase = if (i % 2 == 0) == (side > 0.0) { 0.0 } else { 0.5 };
     LegGeo { attach, full, touchdown: (neutral.0 + shift + h, neutral.1), phase }
@@ -229,7 +229,9 @@ mod tests {
                             assert!(d < 0.01, "foot {i} slid {d} px");
                         }
                         let j = (ppos[i].0 - pos[i].0).hypot(ppos[i].1 - pos[i].1);
-                        assert!(j < 4.0, "foot {i} jumped {j} units");
+                        // a swinging foot outruns the body by ~2.3x at mid-swing; walk() steps 2 px
+                        let limit = 3.0 * 2.0 / FLY_SCALE;
+                        assert!(j < limit, "foot {i} jumped {j} units (limit {limit})");
                     }
                 }
                 prev = Some((planted, pos, world));

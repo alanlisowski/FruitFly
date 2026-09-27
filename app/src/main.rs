@@ -95,8 +95,7 @@ struct Canvas {
     dc: HDC,
     bmp: HBITMAP,
     bits: *mut u8,
-    cache: art::Cache,
-    /// (x, y, heading, gait phase) of the frame on screen. Same again = nothing to do.
+    /// (window x, window y, heading, gait phase) of the frame on screen. Same again = nothing to do.
     shown: Option<[f32; 4]>,
 }
 
@@ -132,7 +131,6 @@ impl Canvas {
             dc,
             bmp,
             bits: bits as *mut u8,
-            cache: art::Cache::new(scale, 0.0),
             shown: None,
         }
     }
@@ -140,20 +138,17 @@ impl Canvas {
     /// Draws `pose` and pushes it to the screen, moving and (if needed) resizing the window.
     /// Skips both if the fly looks exactly as it did last time (e.g. while it stands still).
     fn present(&mut self, hwnd: HWND, pose: &FlyPose, feet: &Feet, scale: f32) {
+        // The window moves in whole art pixels and the fly is drawn at its centre: a fractional
+        // offset inside the pixmap would make non-AA edges flicker (see `art`).
+        let origin = art::window_origin(pose, scale, self.size);
         // Feet follow from these: they only move when the body moves or the gait advances.
-        let key = [pose.x, pose.y, pose.heading, pose.gait_phase];
+        let key = [origin.0 as f32, origin.1 as f32, pose.heading, pose.gait_phase];
         if self.shown == Some(key) {
             return;
         }
         self.shown = Some(key);
-        // Whole-pixel window position (floored); the fly's fractional part is drawn *inside*
-        // the pixmap. Rounding the window instead would make slow motion snap and shimmer.
-        let origin = (
-            pose.x.floor() as i32 - self.size / 2,
-            pose.y.floor() as i32 - self.size / 2,
-        );
         self.pixmap.fill(Color::TRANSPARENT);
-        self.cache.draw(pose, feet, scale, &mut self.pixmap, origin);
+        art::draw(pose, feet, scale, &mut self.pixmap);
 
         // SAFETY: `bits` points to size*size*4 bytes (see `new`), and `&mut self` means nothing
         // else is touching them. Every pointer handed to UpdateLayeredWindow refers to a local
@@ -580,8 +575,12 @@ mod tests {
     /// Windows BGRA out.
     #[test]
     fn red_stays_red() {
+        // The eye's mid red, exactly as the palette gives it, plus a half-alpha pixel.
+        let (r, g, b) = art::EYE[1];
+        let c = Color::from_rgba(r, g, b, 1.0).unwrap().to_color_u8();
+        assert_eq!([c.red(), c.green(), c.blue()], [199, 26, 48]);
         let mut out = [0u8; 8];
-        rgba_to_bgra(&[200, 10, 20, 255, 100, 0, 0, 128], &mut out);
-        assert_eq!(out, [20, 10, 200, 255, 0, 0, 100, 128]);
+        rgba_to_bgra(&[199, 26, 48, 255, 100, 0, 0, 128], &mut out);
+        assert_eq!(out, [48, 26, 199, 255, 0, 0, 100, 128]);
     }
 }
