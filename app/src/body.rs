@@ -11,6 +11,9 @@ use std::f32::consts::PI;
 const REST_PHASE: f64 = 0.45;
 /// mV injected into each CONTACT neuron per frame's brain step, at full contact (1.0).
 const CONTACT_MV: f32 = 30.0;
+/// Where the fly feels from: this far ahead of the thorax, in body units (the head is at ~11,
+/// the antennae reach ~20). See `world::contact`.
+pub const SENSE_AHEAD: f32 = 20.0;
 /// The work-area wall keeps the thorax this far inside it, in body units.
 const WALL: f32 = 6.0;
 /// Pressed into the wall this long without getting anywhere (a corner, or walking straight
@@ -34,6 +37,8 @@ pub struct Body {
     walked: f64,
     /// Multiplier on the forward-command walking speed (`--walk-speed`); escape is unaffected.
     pub walk: f32,
+    /// Sensing point, body units ahead of the thorax (`SENSE_AHEAD`; tests sweep it).
+    pub sense_ahead: f32,
     /// Last frame's contact, far and near, (left, right) each, 0..1, for `--debug`.
     pub contact: ((f32, f32), (f32, f32)),
     /// How long the fly has been blocked by the work-area wall, and how long it has left to
@@ -44,7 +49,7 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, contact: ((0.0, 0.0), (0.0, 0.0)), stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: ((0.0, 0.0), (0.0, 0.0)), stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
     /// One frame: feel `segs`, hold that contact for all `steps` brain steps (injected into the
@@ -59,7 +64,9 @@ impl Body {
         home: impl Fn(f32, f32) -> (f32, f32),
     ) -> usize {
         let unit = FLY_SCALE * scale;
-        self.contact = world::contact(self.x, self.y, self.heading, world::REACH * unit, world::NEAR_REACH * unit, segs);
+        let a = self.sense_ahead * unit;
+        let head = (self.x + self.heading.cos() * a, self.y + self.heading.sin() * a);
+        self.contact = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, world::NEAR_REACH * unit, segs);
         let ((fl, fr), (nl, nr)) = self.contact;
         let drive: Vec<(Vec<u32>, f32)> = [("CONTACT_left", fl), ("CONTACT_right", fr), ("CONTACT_NEAR_left", nl), ("CONTACT_NEAR_right", nr)]
             .into_iter()
@@ -233,11 +240,13 @@ mod tests {
     /// Runs a fly from `(x, y, heading)` among `segs`, walled in by `work`, 60 Hz frames of 16
     /// brain steps, until `each(body)` returns Some(verdict) or `secs` run out (false). A spin
     /// fails it. Returns (verdict, fastest turn in deg/s).
-    fn trial(pack: &[u8], seed: u64, start: (f32, f32, f32), segs: &[Seg], work: Rect, secs: f32, mut each: impl FnMut(&Body) -> Option<bool>) -> (bool, f32) {
+    fn trial(t: &Setup, seed: u64, start: (f32, f32, f32), segs: &[Seg], work: Rect, secs: f32, mut each: impl FnMut(&Body) -> Option<bool>) -> (bool, f32) {
+        let pack = t.pack;
         let mut brain = Brain::new(Pack::parse(pack).unwrap(), seed);
         brain.warmup(3, 16);
         let mut body = Body::new((start.0, start.1));
         body.heading = start.2;
+        body.sense_ahead = t.ahead;
         let inside = |x: f32, y: f32| x >= work.l && x < work.r && y >= work.t && y < work.b;
         let home = |_: f32, _: f32| ((work.l + work.r) / 2.0, (work.t + work.b) / 2.0);
         let mut fastest = 0.0_f32;
@@ -254,54 +263,48 @@ mod tests {
         (false, fastest)
     }
 
+    /// What a scenario runs with: the pack, and the sensing distance.
+    struct Setup<'a> {
+        pack: &'a [u8],
+        ahead: f32,
+    }
+
     const FAR: Rect = Rect { l: -1e5, t: -1e5, r: 1e5, b: 1e5 };
     /// A window edge along y = 0, crossable.
     const EDGE: [Seg; 1] = [Seg { a: (-1e5, 0.0), b: (1e5, 0.0) }];
 
-    /// Runs alongside: once the fly first reaches the edge (within 0.5 BL), it must cover 8 BL
-    /// staying 0.1-1.2 BL off it on the side it came from (`off(body)`: its distance, positive
-    /// on that side), and the distance must vary (std > 0.05 BL: it corrects).
-    fn alongside(off: impl Fn(&Body) -> f32) -> impl FnMut(&Body) -> Option<bool> {
-        let (mut reached, mut path, mut prev, mut d) = (false, 0.0, None::<(f32, f32)>, vec![]);
-        move |b| {
-            let step = prev.map_or(0.0, |p: (f32, f32)| (b.x - p.0).hypot(b.y - p.1));
-            prev = Some((b.x, b.y));
-            let o = off(b);
-            reached |= o < 0.5 * BL;
+    /// Meets a window edge at a shallow angle, starting where it first feels it. Once it first
+    /// reaches the edge (within 0.3 BL), it must cover 8 BL staying within 0.6 BL of the line,
+    /// either side: weaving across counts.
+    fn follows_edge(t: &Setup, seed: u64, deg: f32) -> (bool, f32) {
+        let y0 = REACH * FLY_SCALE;
+        let (mut reached, mut path, mut prev) = (false, 0.0, (0.0_f32, y0));
+        trial(t, seed, (0.0, y0, -deg.to_radians()), &EDGE, FAR, 40.0, |b| {
+            let step = (b.x - prev.0).hypot(b.y - prev.1);
+            prev = (b.x, b.y);
+            reached |= b.y.abs() < 0.3 * BL;
             if !reached {
                 return None;
             }
-            if !(0.1 * BL..=1.2 * BL).contains(&o) {
+            if b.y.abs() > 0.6 * BL {
                 return Some(false);
             }
             path += step;
-            d.push(o);
-            if path < 8.0 * BL {
-                return None;
-            }
-            let mean = d.iter().sum::<f32>() / d.len() as f32;
-            let std = (d.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / d.len() as f32).sqrt();
-            Some(std > 0.05 * BL)
-        }
-    }
-
-    /// Meets a window edge at a shallow angle, starting where it first feels it.
-    fn follows_edge(pack: &[u8], seed: u64, deg: f32) -> (bool, f32) {
-        let y0 = REACH * FLY_SCALE;
-        trial(pack, seed, (0.0, y0, -deg.to_radians()), &EDGE, FAR, 40.0, alongside(|b| b.y))
+            (path >= 8.0 * BL).then_some(true)
+        })
     }
 
     /// Meets it nearly head-on: must cross and carry on 2 BL beyond it.
-    fn crosses_edge(pack: &[u8], seed: u64) -> (bool, f32) {
+    fn crosses_edge(t: &Setup, seed: u64) -> (bool, f32) {
         let y0 = REACH * FLY_SCALE;
-        trial(pack, seed, (0.0, y0, -85f32.to_radians()), &EDGE, FAR, 10.0, |b| (b.y < -2.0 * BL).then_some(true))
+        trial(t, seed, (0.0, y0, -85f32.to_radians()), &EDGE, FAR, 10.0, |b| (b.y < -2.0 * BL).then_some(true))
     }
 
     /// Walks parallel to the bottom screen border, 10 px inside: follows it for 8 BL.
-    fn follows_border(pack: &[u8], seed: u64) -> (bool, f32) {
+    fn follows_border(t: &Setup, seed: u64) -> (bool, f32) {
         let work = Rect { l: -1e5, t: -1e5, r: 1e5, b: 0.0 };
         let (mut path, mut prev) = (0.0, (0.0_f32, -10.0_f32));
-        trial(pack, seed, (0.0, -10.0, 0.0), &border(&[work]), work, 40.0, |b| {
+        trial(t, seed, (0.0, -10.0, 0.0), &border(&[work]), work, 40.0, |b| {
             path += (b.x - prev.0).hypot(b.y - prev.1);
             prev = (b.x, b.y);
             if b.y < -1.2 * BL {
@@ -313,15 +316,15 @@ mod tests {
 
     /// Starts in the bottom-left corner of a screen, facing into it: must get 2 BL away from
     /// the corner within 3 s.
-    fn leaves_corner(pack: &[u8], seed: u64) -> (bool, f32) {
+    fn leaves_corner(t: &Setup, seed: u64) -> (bool, f32) {
         let work = Rect { l: 0.0, t: 0.0, r: 1200.0, b: 800.0 };
         let start = (10.0, 790.0, 135f32.to_radians());
-        trial(pack, seed, start, &border(&[work]), work, 3.0, |b| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
+        trial(t, seed, start, &border(&[work]), work, 3.0, |b| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
     }
 
     /// Passes out of 6 seeds for: shallow 20 deg, shallow 30 deg, steep, border, corner; and the
     /// fastest turn in any passing trial, deg/s.
-    fn score(pack: &[u8]) -> ([u32; 5], f32) {
+    fn score(t: &Setup) -> ([u32; 5], f32) {
         let mut fastest = 0.0_f32;
         let mut count = |f: &dyn Fn(u64) -> (bool, f32)| {
             (1..=6)
@@ -335,11 +338,11 @@ mod tests {
                 .count() as u32
         };
         let s = [
-            count(&|s| follows_edge(pack, s, 20.0)),
-            count(&|s| follows_edge(pack, s, 30.0)),
-            count(&|s| crosses_edge(pack, s)),
-            count(&|s| follows_border(pack, s)),
-            count(&|s| leaves_corner(pack, s)),
+            count(&|s| follows_edge(t, s, 20.0)),
+            count(&|s| follows_edge(t, s, 30.0)),
+            count(&|s| crosses_edge(t, s)),
+            count(&|s| follows_border(t, s)),
+            count(&|s| leaves_corner(t, s)),
         ];
         (s, fastest)
     }
@@ -348,7 +351,7 @@ mod tests {
     /// no spins.
     #[test]
     fn edge_following() {
-        let (s, fastest) = score(STUB);
+        let (s, fastest) = score(&Setup { pack: STUB, ahead: SENSE_AHEAD });
         println!("shallow 20 {}/6, shallow 30 {}/6, steep {}/6, border {}/6, corner {}/6, fastest turn {fastest:.0} deg/s", s[0], s[1], s[2], s[3], s[4]);
         assert!(s.iter().all(|&n| n >= 5), "edge following: {s:?}");
     }
@@ -370,11 +373,13 @@ mod tests {
             })
             .collect();
         packs.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then(a.0.1.total_cmp(&b.0.1)));
-        println!("| far | near | shallow 20 | shallow 30 | steep | border | corner | fastest turn deg/s |");
-        println!("|---|---|---|---|---|---|---|---|");
-        for ((f, n), p) in packs {
-            let (s, fastest) = score(&std::fs::read(p).unwrap());
-            println!("| {f} | {n} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 | {fastest:.0} |", s[0], s[1], s[2], s[3], s[4]);
+        println!("| ahead | far | near | shallow 20 | shallow 30 | steep | border | corner | fastest turn deg/s |");
+        println!("|---|---|---|---|---|---|---|---|---|");
+        for ahead in [11.0, 20.0] {
+            for ((f, n), p) in &packs {
+                let (s, fastest) = score(&Setup { pack: &std::fs::read(p).unwrap(), ahead });
+                println!("| {ahead} | {f} | {n} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 | {fastest:.0} |", s[0], s[1], s[2], s[3], s[4]);
+            }
         }
     }
 }

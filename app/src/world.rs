@@ -152,21 +152,27 @@ fn falloff(d: f32, reach: f32) -> f32 {
 }
 
 /// What the fly feels, far and near: ((left, right), (left, right)), each 0..1. Per segment,
-/// its nearest point: strength falls off smoothly with distance (`reach` far, `near_reach`
-/// near), and is split between the sides by the sine of the point's bearing from the heading,
-/// so an edge dead ahead feeds neither side much and nothing flips as the bearing sweeps
-/// round. Full ahead and beside, fading to 0 directly behind. Summed per side, clamped.
-pub fn contact(x: f32, y: f32, heading: f32, reach: f32, near_reach: f32, segs: &[Seg]) -> ((f32, f32), (f32, f32)) {
+/// the point nearest the `head` (the sensing point, ahead of the thorax): strength falls off
+/// smoothly with its distance from the head (`reach` far, `near_reach` near). Side and "behind"
+/// are judged from the `thorax`: the point's bearing from the heading splits the strength by
+/// its sine, so an edge dead ahead feeds neither side much and nothing flips as the bearing
+/// sweeps round; full ahead and beside, fading to 0 directly behind. Summed per side, clamped.
+///
+/// Sensing ahead of the thorax is what damps edge following: angled toward an edge, the head
+/// is nearer than the thorax, so the fly corrects before it gets there. Judging side from the
+/// thorax keeps an edge the head has just crossed from vanishing "behind" the head.
+pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, near_reach: f32, segs: &[Seg]) -> ((f32, f32), (f32, f32)) {
     let (hx, hy) = (heading.cos(), heading.sin());
     let (mut far, mut near) = ((0.0_f32, 0.0_f32), (0.0_f32, 0.0_f32));
     for s in segs {
-        let p = nearest(s, (x, y));
-        let (dx, dy) = (p.0 - x, p.1 - y);
-        let d = dx.hypot(dy);
-        if d >= reach || d < 1e-6 {
+        let p = nearest(s, head);
+        let d = (p.0 - head.0).hypot(p.1 - head.1);
+        let (dx, dy) = (p.0 - thorax.0, p.1 - thorax.1);
+        let b = dx.hypot(dy);
+        if d >= reach || b < 1e-6 {
             continue;
         }
-        let (cos, sin) = ((hx * dx + hy * dy) / d, (hx * dy - hy * dx) / d); // y down: sin > 0 = right
+        let (cos, sin) = ((hx * dx + hy * dy) / b, (hx * dy - hy * dx) / b); // y down: sin > 0 = right
         let ahead = (1.0 + cos).min(1.0);
         let (l, r) = ((-sin).max(0.0) * ahead, sin.max(0.0) * ahead);
         let (f, n) = (falloff(d, reach), falloff(d, near_reach));
@@ -385,7 +391,7 @@ mod tests {
     #[test]
     fn contact_sides_reach_and_behind() {
         let (reach, near) = (50.0, 12.0);
-        let feel = |heading: f32, segs: &[Seg]| contact(0.0, 0.0, heading, reach, near, segs);
+        let feel = |heading: f32, segs: &[Seg]| contact((0.0, 0.0), (0.0, 0.0), heading, reach, near, segs);
         // Fly at the origin facing +x; an edge along y = -20 is on its left (y down).
         let edge = [Seg { a: (-500.0, -20.0), b: (500.0, -20.0) }];
         let ((l, r), (nl, nr)) = feel(0.0, &edge);
@@ -413,5 +419,12 @@ mod tests {
         // Smooth: no jump near the edge of reach.
         let at = |d: f32| feel(0.0, &[Seg { a: (-500.0, -d), b: (500.0, -d) }]).0.0;
         assert!(at(49.0) < 0.01 && (at(30.0) - at(30.5)).abs() < 0.02);
+        // Head ahead of the thorax, already across a line the thorax hasn't reached (heading
+        // -80 deg, line at y = -5): judged from the head the line would be straight behind it
+        // and vanish; judged from the thorax it's ahead and a little left, so it still counts,
+        // and being nearly straight across the path, it feeds that side only a little.
+        let line = [Seg { a: (-500.0, -5.0), b: (500.0, -5.0) }];
+        let ((l, r), _) = contact((0.0, 0.0), (0.0, -10.0), -1.4, reach, near, &line);
+        assert!(l > 0.05 && l < 0.3 && r == 0.0, "({l}, {r})");
     }
 }
