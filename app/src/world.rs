@@ -112,13 +112,21 @@ pub fn feelable(rects: &[Rect], work: &[Rect]) -> Vec<Seg> {
 /// Visible window edges. `rects` are in z-order, topmost first (as EnumWindows returns them):
 /// each window's sides are clipped against every window above it.
 pub fn visible_edges(rects: &[Rect]) -> Vec<Seg> {
-    let mut out = vec![];
-    for (i, r) in rects.iter().enumerate() {
-        for (s, _) in sides(r) {
-            out.extend(uncovered(s, &rects[..i]));
-        }
-    }
-    out
+    visible_edges_by_window(rects).into_iter().flatten().collect()
+}
+
+/// `visible_edges`, per window.
+pub fn visible_edges_by_window(rects: &[Rect]) -> Vec<Vec<Seg>> {
+    rects.iter().enumerate().map(|(i, r)| sides(r).into_iter().flat_map(|(s, _)| uncovered(s, &rects[..i])).collect()).collect()
+}
+
+/// Distance from `p` to the nearest of `segs` (infinite if none).
+#[cfg(test)]
+pub fn distance(p: (f32, f32), segs: &[Seg]) -> f32 {
+    segs.iter().map(|s| {
+        let q = nearest(s, p);
+        (q.0 - p.0).hypot(q.1 - p.1)
+    }).fold(f32::INFINITY, f32::min)
 }
 
 /// The outer border of the union of the work areas: each side, minus the parts where another
@@ -178,6 +186,36 @@ pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, s
         r += w * sin.max(0.0);
     }
     (l.min(1.0), r.min(1.0))
+}
+
+/// Mechanosensory adaptation, per side: under contact a receptor's gain sinks toward
+/// `ADAPT_FLOOR` (tau `ADAPT_MS`), without contact it recovers toward 1 (tau `RECOVER_MS`). So
+/// the fly follows an edge for a while, then its grip on it fades and it drifts off.
+pub const ADAPT_MS: f32 = 3000.0;
+pub const RECOVER_MS: f32 = 10_000.0;
+pub const ADAPT_FLOOR: f32 = 0.3;
+/// Raw contact above this counts as "under contact".
+const TOUCHING: f32 = 0.02;
+
+pub struct Adapt {
+    /// Current gain, (left, right), `ADAPT_FLOOR..=1`.
+    pub gain: (f32, f32),
+}
+
+impl Adapt {
+    pub fn new() -> Adapt {
+        Adapt { gain: (1.0, 1.0) }
+    }
+
+    /// Advances `dt_ms` with this `raw` contact held; returns the adapted contact.
+    pub fn step(&mut self, raw: (f32, f32), dt_ms: f32) -> (f32, f32) {
+        let relax = |g: f32, c: f32| {
+            let (target, tau) = if c > TOUCHING { (ADAPT_FLOOR, ADAPT_MS) } else { (1.0, RECOVER_MS) };
+            target + (g - target) * (-dt_ms / tau).exp()
+        };
+        self.gain = (relax(self.gain.0, raw.0), relax(self.gain.1, raw.1));
+        (raw.0 * self.gain.0, raw.1 * self.gain.1)
+    }
 }
 
 // --- Win32 ----------------------------------------------------------------------------------
@@ -373,6 +411,24 @@ mod tests {
         let two = [rect(0.0, 0.0, 1920.0, 1040.0), rect(1920.0, 0.0, 3840.0, 1200.0)];
         let b = border(&two);
         assert_eq!(total(&b), 2.0 * 3840.0 + 1040.0 + 1200.0 + (1200.0 - 1040.0));
+    }
+
+    /// Adaptation curve: one tau of contact takes the gain 63% of the way to the floor, ten all
+    /// but settle it there; one recovery tau without contact brings it 63% of the way back.
+    #[test]
+    fn adaptation_curve() {
+        let mut a = Adapt::new();
+        let run = |a: &mut Adapt, raw: (f32, f32), ms: u32| (0..ms / 16).for_each(|_| _ = a.step(raw, 16.0));
+        run(&mut a, (0.5, 0.0), ADAPT_MS as u32);
+        let expect = ADAPT_FLOOR + (1.0 - ADAPT_FLOOR) * (-1.0f32).exp();
+        assert!((a.gain.0 - expect).abs() < 0.01, "after one tau: {} vs {expect}", a.gain.0);
+        assert_eq!(a.gain.1, 1.0, "the untouched side doesn't adapt");
+        run(&mut a, (0.5, 0.0), 9 * ADAPT_MS as u32);
+        assert!((a.gain.0 - ADAPT_FLOOR).abs() < 0.01, "after ten tau: {}", a.gain.0);
+        assert!((a.step((0.5, 0.0), 0.0).0 - 0.5 * a.gain.0).abs() < 1e-6, "output = raw x gain");
+        run(&mut a, (0.0, 0.0), RECOVER_MS as u32);
+        let back = 1.0 - (1.0 - ADAPT_FLOOR) * (-1.0f32).exp();
+        assert!((a.gain.0 - back).abs() < 0.02, "one recovery tau later: {} vs {back}", a.gain.0);
     }
 
     #[test]

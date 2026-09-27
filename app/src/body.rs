@@ -19,9 +19,22 @@ const WALL: f32 = 6.0;
 /// Pressed into the wall this long without getting anywhere (a corner, or walking straight
 /// into it), the fly turns away.
 const STUCK_MS: f32 = 1000.0;
-/// ...and keeps turning this long. A one-frame turn doesn't last: the brain holds its heading
-/// (PFL3) and steers straight back into the wall.
+/// ...and keeps turning this long. A one-frame turn doesn't last: contact with the walls pulls
+/// the fly straight back in.
 const UNSTICK_MS: f32 = 600.0;
+/// Sliding along the wall while pressing into it for a random 1.5-4 s (so it doesn't look
+/// mechanical), the fly changes course away from it by a random 90-150 deg...
+const PRESS_MS: (f32, f32) = (1500.0, 4000.0);
+const COURSE_TURN_DEG: (f32, f32) = (90.0, 150.0);
+/// The press clock runs at full speed with the fly heading this far or more into the wall, and
+/// proportionally slower below: skimming along the border (edge following) lasts a while,
+/// pushing into it doesn't, and neither lasts forever. (A hard angle cutoff can't tell them
+/// apart: the live bug was a fly skimming at 10-20 deg for minutes.)
+const PRESS_FULL_DEG: f32 = 30.0;
+/// ...turning at this rate, with the PENs of the turning side driven throughout, so the heading
+/// bump turns with the body.
+const COURSE_RATE: f32 = 240.0 / 180.0 * PI / 1000.0; // rad/ms
+const PEN_MV: f32 = 5.5;
 
 pub struct Body {
     /// Physical screen pixels.
@@ -39,8 +52,17 @@ pub struct Body {
     pub walk: f32,
     /// Sensing point, body units ahead of the thorax (`SENSE_AHEAD`; tests sweep it).
     pub sense_ahead: f32,
-    /// Last frame's contact (left, right), 0..1, for `--debug`.
+    /// Last frame's contact (left, right), 0..1, after adaptation, for `--debug`.
     pub contact: (f32, f32),
+    pub adapt: world::Adapt,
+    /// How long the fly has been pressing into the wall while sliding along it, the (random)
+    /// limit, and what's left of a course change, in radians (signed).
+    press_ms: f32,
+    press_limit: f32,
+    course_turn: f32,
+    /// PEN drive (left, right), mV, held for the next frame's brain steps.
+    pen: (f32, f32),
+    rng: u64,
     /// How long the fly has been blocked by the work-area wall, and how long it has left to
     /// turn away from it.
     stuck_ms: f32,
@@ -49,11 +71,20 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), adapt: world::Adapt::new(), press_ms: 0.0, press_limit: 2500.0, course_turn: 0.0, pen: (0.0, 0.0), rng: 0x9E37_79B9_7F4A_7C15, stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
-    /// One frame: feel `segs`, hold that contact for all `steps` brain steps (injected into the
-    /// CONTACT neurons like looming is), then move. Returns the spike count.
+    /// xorshift64*: uniform in [a, b).
+    fn uniform(&mut self, (a, b): (f32, f32)) -> f32 {
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        let u = (self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u32 << 24) as f32;
+        a + (b - a) * u
+    }
+
+    /// One frame: feel `segs` (through adaptation), hold that contact for all `steps` brain steps
+    /// (injected into the CONTACT neurons like looming is), then move. Returns the spike count.
     pub fn tick(
         &mut self,
         brain: &mut Brain,
@@ -66,13 +97,17 @@ impl Body {
         let unit = FLY_SCALE * scale;
         let a = self.sense_ahead * unit;
         let head = (self.x + self.heading.cos() * a, self.y + self.heading.sin() * a);
-        self.contact = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, segs);
+        let raw = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, segs);
+        self.contact = self.adapt.step(raw, steps as f32);
         let left = brain.pack.sensory("CONTACT_left").to_vec();
         let right = brain.pack.sensory("CONTACT_right").to_vec();
+        let (pen_l, pen_r) = (brain.pack.by_type("PEN_a", Some("left")), brain.pack.by_type("PEN_a", Some("right")));
         let mut spikes = 0;
         for _ in 0..steps {
             brain.inject(&left, CONTACT_MV * self.contact.0);
             brain.inject(&right, CONTACT_MV * self.contact.1);
+            brain.inject(&pen_l, self.pen.0);
+            brain.inject(&pen_r, self.pen.1);
             spikes += brain.step();
         }
         self.update(brain, steps as f32, scale, inside, home);
@@ -128,21 +163,49 @@ impl Body {
 
         // The work-area border is a hard wall (window edges are sensed and crossable; following
         // any edge is the brain's job, see `tick`). Blocked, the fly slides along the wall, per
-        // axis. Still getting nowhere after STUCK_MS (a corner, or walking straight into it),
-        // it turns toward the middle of its monitor and feeds that turn to the PENs, so the
-        // brain's heading estimate agrees with the body.
+        // axis. Two ways out, both turning the body AND driving the PENs of that side, so the
+        // heading bump turns with it:
+        // - pressing into the wall while sliding along it for PRESS_MS: a course change away
+        //   from the wall by COURSE_TURN_DEG (otherwise it slides along the border forever);
+        // - getting nowhere for STUCK_MS (a corner, or walking straight in): turn toward the
+        //   middle of its monitor for UNSTICK_MS.
         if !inside(self.x, self.y) {
             (self.x, self.y) = home(self.x, self.y); // monitor unplugged, taskbar moved...
         }
         let m = WALL * FLY_SCALE * scale;
-        let mut blocked = false;
-        if !inside(self.x - m, self.y) || !inside(self.x + m, self.y) {
+        let (mut blocked, mut inward) = (false, (0.0_f32, 0.0_f32));
+        let (left_out, right_out) = (!inside(self.x - m, self.y), !inside(self.x + m, self.y));
+        if left_out || right_out {
             self.x = old_x;
             blocked = true;
+            inward.0 = left_out as i32 as f32 - right_out as i32 as f32;
         }
-        if !inside(self.x, self.y - m) || !inside(self.x, self.y + m) {
+        let (top_out, bottom_out) = (!inside(self.x, self.y - m), !inside(self.x, self.y + m));
+        if top_out || bottom_out {
             self.y = old_y;
             blocked = true;
+            inward.1 = top_out as i32 as f32 - bottom_out as i32 as f32;
+        }
+        self.pen = (0.0, 0.0);
+        let wrap = |a: f32| a.sin().atan2(a.cos());
+        let into_wall = -(self.heading.cos() * inward.0 + self.heading.sin() * inward.1) / inward.0.hypot(inward.1).max(1e-6);
+        let pressing = blocked && into_wall > 0.0 && self.course_turn == 0.0;
+        let rate = (into_wall / PRESS_FULL_DEG.to_radians().sin()).min(1.0);
+        self.press_ms = if pressing { self.press_ms + dt_ms * rate } else { 0.0 };
+        if self.press_ms > self.press_limit {
+            let away = wrap(inward.1.atan2(inward.0) - self.heading);
+            let amount = self.uniform(COURSE_TURN_DEG).to_radians();
+            self.course_turn = if away < 0.0 { -amount } else { amount };
+            self.press_limit = self.uniform(PRESS_MS);
+            self.press_ms = 0.0;
+        }
+        if self.course_turn != 0.0 {
+            let d = self.course_turn.signum() * (COURSE_RATE * dt_ms).min(self.course_turn.abs());
+            self.heading = wrap(self.heading + d);
+            self.course_turn -= d;
+            // Heading increasing = turning right on screen; left PEN drive walks the bump that way
+            // (same convention as milestone 3's bounce).
+            self.pen = if d > 0.0 { (PEN_MV, 0.0) } else { (0.0, PEN_MV) };
         }
         let moved = (self.x - old_x).hypot(self.y - old_y);
         let stuck = blocked && moved < 0.3 * step * scale;
@@ -156,8 +219,7 @@ impl Body {
             let inward = (hy - self.y).atan2(hx - self.x);
             let diff = (inward - self.heading).sin().atan2((inward - self.heading).cos());
             self.heading += diff * 0.16;
-            let pen = brain.pack.by_type("PEN_a", Some(if diff > 0.0 { "left" } else { "right" }));
-            brain.inject(&pen, 5.5);
+            self.pen = if diff > 0.0 { (PEN_MV, 0.0) } else { (0.0, PEN_MV) };
         }
     }
 
@@ -350,6 +412,79 @@ mod tests {
         let (s, fastest) = score(&Setup { pack: STUB, ahead: SENSE_AHEAD }, 12);
         println!("shallow 20 {}/12, shallow 30 {}/12, steep {}/12, border {}/12, corner {}/12, fastest turn {fastest:.0} deg/s", s[0], s[1], s[2], s[3], s[4]);
         assert!(s.iter().all(|&n| n >= 10), "edge following: {s:?}");
+    }
+
+    /// Walking down into the bottom border at 70 deg: it must slide along it, change course,
+    /// and get more than 1 BL away within 20 s. (The live bug: the fly slid along the bottom
+    /// border forever, heading into the taskbar.) Usually ~4 s; longer when far contact pulls it
+    /// back after the course change and it takes adaptation to let go.
+    #[test]
+    fn leaves_the_border_it_presses_into() {
+        let work = Rect { l: 0.0, t: 0.0, r: 1920.0, b: 1020.0 };
+        for seed in 1..=6 {
+            let t = Setup { pack: STUB, ahead: SENSE_AHEAD };
+            let mut secs = 0.0;
+            let (ok, _) = trial(&t, seed, (600.0, 1005.0, 70f32.to_radians()), &border(&[work]), work, 20.0, |b| {
+                secs += 1.0 / 60.0;
+                (1020.0 - b.y > BL).then_some(true)
+            });
+            println!("seed {seed}: left the border after {secs:.1} s");
+            assert!(ok, "seed {seed}: still on the bottom border after 20 s");
+        }
+    }
+
+    /// Five minutes on a 1920 x 1020 desktop with three overlapping windows: the fly must not
+    /// live on the border (< 35% of the time within 1 BL of it), must visit edges of at least 2
+    /// of the 3 windows (within 1 BL), and no single edge may hold it for more than 40 s.
+    #[test]
+    fn soak_five_minutes() {
+        use crate::world::{distance, feelable, visible_edges_by_window};
+        let work = [Rect { l: 0.0, t: 0.0, r: 1920.0, b: 1020.0 }];
+        let windows = [
+            Rect { l: 250.0, t: 150.0, r: 950.0, b: 650.0 },
+            Rect { l: 700.0, t: 400.0, r: 1500.0, b: 900.0 },
+            Rect { l: 1200.0, t: 120.0, r: 1750.0, b: 600.0 },
+        ];
+        let segs = feelable(&windows, &work);
+        let per_window = visible_edges_by_window(&windows);
+        let edge_of = |p: (f32, f32)| {
+            // the one edge within 1 BL, if any: (index into segs)
+            segs.iter()
+                .enumerate()
+                .map(|(i, s)| (i, distance(p, std::slice::from_ref(s))))
+                .filter(|&(_, d)| d < BL)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
+        let border_segs = border(&work);
+        let mut failures = vec![];
+        for seed in 1..=6u64 {
+            let mut brain = Brain::new(Pack::parse(STUB).unwrap(), seed);
+            brain.warmup(3, 16);
+            let mut body = Body::new((960.0, 510.0));
+            let inside = |x: f32, y: f32| x >= 0.0 && x < 1920.0 && y >= 0.0 && y < 1020.0;
+            let (mut near_border, mut visited, mut run, mut longest) = (0u32, [false; 3], (None, 0u32), 0u32);
+            let frames = 60 * 300;
+            for _ in 0..frames {
+                body.tick(&mut brain, 16, 1.0, &segs, inside, |_, _| (960.0, 510.0));
+                let p = (body.x, body.y);
+                near_border += (distance(p, &border_segs) < BL) as u32;
+                for (w, v) in visited.iter_mut().enumerate() {
+                    *v |= distance(p, &per_window[w]) < BL;
+                }
+                let e = edge_of(p);
+                run = if e.is_some() && e == run.0 { (e, run.1 + 1) } else { (e, 1) };
+                if e.is_some() {
+                    longest = longest.max(run.1);
+                }
+            }
+            let (border_pct, windows_hit, longest_s) = (near_border as f32 / frames as f32 * 100.0, visited.iter().filter(|&&v| v).count(), longest as f32 / 60.0);
+            println!("seed {seed}: near border {border_pct:.0}% of the time, windows visited {windows_hit}/3, longest on one edge {longest_s:.1} s");
+            if border_pct >= 35.0 || windows_hit < 2 || longest_s > 40.0 {
+                failures.push(seed);
+            }
+        }
+        assert!(failures.is_empty(), "soak failed for seeds {failures:?}");
     }
 
     /// The CONTACT weight sweep, 6 seeds (12 with `FLIT_SEEDS=12`). Packs come from

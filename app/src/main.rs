@@ -278,12 +278,14 @@ impl Driver {
                         (*ms, *n, *prints) = (0, 0, *prints + 1);
                         if *prints % 2 == 0 {
                             println!(
-                                "  world: {} windows, {} segments, poll {:.2} ms, contact L {:.2} R {:.2}",
+                                "  world: {} windows, {} segments, poll {:.2} ms, contact L {:.2} R {:.2}, adapt L {:.2} R {:.2}",
                                 world.rects.len(),
                                 world.segs.len(),
                                 world.poll_ms,
                                 body.contact.0,
-                                body.contact.1
+                                body.contact.1,
+                                body.adapt.gain.0,
+                                body.adapt.gain.1
                             );
                         }
                     }
