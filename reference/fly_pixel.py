@@ -152,7 +152,10 @@ def draw_legs(c, stride):
             phase = 1 if (i % 2 == 0) == (side > 0) else -1      # alternating tripod
             fx += stride * phase
             k1, k2 = two_bone(ax, ay, fx, fy, f, t)
-            kx, ky = k1 if abs(k1[1]) > abs(k2[1]) else k2       # knee away from the body
+            if i == 1:   # middle: knee bends backward, clear of the front leg
+                kx, ky = k1 if k1[0] < k2[0] else k2
+            else:        # front, hind: knee away from the body
+                kx, ky = k1 if abs(k1[1]) > abs(k2[1]) else k2
             leg_line(c, [(ax, ay), (kx, ky), (fx, fy)], GREY[1], 1.2)
             # round foot
             cr = c.cr

@@ -80,8 +80,11 @@ Style: `WS_POPUP` -- no title bar, border or menu. The window is exactly our pix
   on any curve, at any frame rate (`planted_feet_stay_put`, `no_skating_and_clean_stops`).
 - **Reach**: legs have fixed lengths, and a stride around the reference's rest foot can
   overshoot full reach. So each leg's stride window is slid along x just enough to stay
-  reachable, and the stride is 3 units: the largest round value at which no legs cross at any
-  gait phase or on tight turns, and no foot leaves reach (at 3.5, legs cross on a curved walk).
+  reachable, and the stride is 4.5 units: the largest round value at which no legs cross at any
+  gait phase or on tight turns, and no foot leaves reach (at 5, a middle and hind leg cross).
+  Middle knees bend backward (front and hind: away from the midline); with the long middle
+  femur the outward knee would point forward into the front leg. That's ~13.6 steps/s at the
+  brain's normal walking speed, slow enough to see at 60 fps (`steps_slow_enough_to_see`).
 - **Stopping**: stops only happen at gait phases where all six feet are on the ground
   (multiples of half a cycle), so no foot is left hanging in the air.
 - **Pause**: `Clock` only accumulates time while running and re-bases on every Pause/Resume, so

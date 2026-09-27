@@ -168,8 +168,9 @@ struct Joints {
 }
 
 /// Leg `k`'s joints: the foot comes from the gait (`Feet`), the knee from the reference's
-/// two-bone IK with FIXED femur and tibia lengths, choosing the knee farther from the body's
-/// midline.
+/// two-bone IK with FIXED femur and tibia lengths. Front and hind knees: the solution farther
+/// from the body's midline. Middle knees: the one further back (with the long middle femur the
+/// outward knee points forward and crosses the front leg).
 fn joints(k: usize, feet: &Feet) -> Joints {
     let (_, _, f, t) = LEGS[k % 3];
     let g = leg_geo(k);
@@ -183,7 +184,13 @@ fn joints(k: usize, feet: &Feet) -> Joints {
         foot = (g.attach.0 + dx * s, g.attach.1 + dy * s);
     }
     let (k1, k2) = two_bone(g.attach, foot, f, t);
-    let knee = if k1.1.abs() > k2.1.abs() { k1 } else { k2 };
+    let knee = if k % 3 == 1 {
+        if k1.0 < k2.0 { k1 } else { k2 } // middle legs bend backward, clear of the front legs
+    } else if k1.1.abs() > k2.1.abs() {
+        k1
+    } else {
+        k2
+    };
     Joints { attach: g.attach, knee, foot }
 }
 

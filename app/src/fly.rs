@@ -20,7 +20,7 @@ const SWING: f32 = 1.0 - STANCE;
 /// How far (body units) a planted foot travels backward relative to the body per step.
 /// The largest round value at which no legs cross at ANY gait phase and every foot stays in
 /// reach (`legs_never_cross_and_never_stretch` in art.rs, `feet_stay_within_reach`).
-const STRIDE: f32 = 2.0;
+const STRIDE: f32 = 4.5;
 /// Peak lift of a swinging foot, drawn as a sideways offset (we look from above).
 const LIFT: f32 = 1.2;
 /// Distance the body walks per full gait cycle. A foot stays put on the ground for the whole
