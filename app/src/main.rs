@@ -265,24 +265,25 @@ impl Driver {
                     if *ms >= 500 {
                         let (angle, mag) = brain.bump();
                         println!(
-                            "turn {:+7.1}  fwd {:6.1}  bump {:+5.0} deg  mag {:.2}  {:5.0} spikes/s",
+                            "turn {:+7.1}  fwd {:6.1}  bump {:+5.0} deg  mag {:.2}  {:5.0} spikes/s  at {:.0} {:.0} hd {:+.0}",
                             brain.turn_command(),
                             brain.forward_command(),
                             angle.to_degrees(),
                             mag,
-                            *n as f32 * 1000.0 / *ms as f32
+                            *n as f32 * 1000.0 / *ms as f32,
+                            body.x,
+                            body.y,
+                            body.heading.to_degrees()
                         );
                         (*ms, *n, *prints) = (0, 0, *prints + 1);
                         if *prints % 2 == 0 {
                             println!(
-                                "  world: {} windows, {} segments, poll {:.2} ms, contact far L {:.2} R {:.2}, near L {:.2} R {:.2}",
+                                "  world: {} windows, {} segments, poll {:.2} ms, contact L {:.2} R {:.2}",
                                 world.rects.len(),
                                 world.segs.len(),
                                 world.poll_ms,
-                                body.contact.0.0,
-                                body.contact.0.1,
-                                body.contact.1.0,
-                                body.contact.1.1
+                                body.contact.0,
+                                body.contact.1
                             );
                         }
                     }

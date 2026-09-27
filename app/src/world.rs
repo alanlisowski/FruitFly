@@ -16,10 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// Nose to abdomen tip, in body units (see `fly.rs`).
 pub const BODY_LENGTH: f32 = 37.0;
-/// How far the fly feels, from the thorax, in body units: ~1.2 body lengths (far contact,
-/// turns toward the edge) and ~0.3 (near contact, turns away).
+/// How far the fly feels, from its sensing point, in body units: ~1.2 body lengths.
 pub const REACH: f32 = 1.2 * BODY_LENGTH;
-pub const NEAR_REACH: f32 = 0.3 * BODY_LENGTH;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -151,19 +149,21 @@ fn falloff(d: f32, reach: f32) -> f32 {
     u * u * (3.0 - 2.0 * u)
 }
 
-/// What the fly feels, far and near: ((left, right), (left, right)), each 0..1. Per segment,
-/// the point nearest the `head` (the sensing point, ahead of the thorax): strength falls off
-/// smoothly with its distance from the head (`reach` far, `near_reach` near). Side and "behind"
+/// What the fly feels: (left, right), each 0..1. Per segment, the point nearest the `head`
+/// (the sensing point, ahead of the thorax): strength falls off smoothly with its distance
+/// from the head, 0 at `reach`. Side and "behind"
 /// are judged from the `thorax`: the point's bearing from the heading splits the strength by
 /// its sine, so an edge dead ahead feeds neither side much and nothing flips as the bearing
 /// sweeps round; full ahead and beside, fading to 0 directly behind. Summed per side, clamped.
 ///
 /// Sensing ahead of the thorax is what damps edge following: angled toward an edge, the head
 /// is nearer than the thorax, so the fly corrects before it gets there. Judging side from the
-/// thorax keeps an edge the head has just crossed from vanishing "behind" the head.
-pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, near_reach: f32, segs: &[Seg]) -> ((f32, f32), (f32, f32)) {
+/// thorax keeps an edge the head has just crossed from vanishing "behind" the head. With the
+/// edge on its left the fly turns left (CONTACT -> ipsilateral DNa02); crossing puts it on the
+/// right, and the fly turns back: it ends up running along the line.
+pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, segs: &[Seg]) -> (f32, f32) {
     let (hx, hy) = (heading.cos(), heading.sin());
-    let (mut far, mut near) = ((0.0_f32, 0.0_f32), (0.0_f32, 0.0_f32));
+    let (mut l, mut r) = (0.0_f32, 0.0_f32);
     for s in segs {
         let p = nearest(s, head);
         let d = (p.0 - head.0).hypot(p.1 - head.1);
@@ -173,13 +173,11 @@ pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, n
             continue;
         }
         let (cos, sin) = ((hx * dx + hy * dy) / b, (hx * dy - hy * dx) / b); // y down: sin > 0 = right
-        let ahead = (1.0 + cos).min(1.0);
-        let (l, r) = ((-sin).max(0.0) * ahead, sin.max(0.0) * ahead);
-        let (f, n) = (falloff(d, reach), falloff(d, near_reach));
-        far = (far.0 + f * l, far.1 + f * r);
-        near = (near.0 + n * l, near.1 + n * r);
+        let w = falloff(d, reach) * (1.0 + cos).min(1.0);
+        l += w * (-sin).max(0.0);
+        r += w * sin.max(0.0);
     }
-    ((far.0.min(1.0), far.1.min(1.0)), (near.0.min(1.0), near.1.min(1.0)))
+    (l.min(1.0), r.min(1.0))
 }
 
 // --- Win32 ----------------------------------------------------------------------------------
@@ -390,41 +388,37 @@ mod tests {
 
     #[test]
     fn contact_sides_reach_and_behind() {
-        let (reach, near) = (50.0, 12.0);
-        let feel = |heading: f32, segs: &[Seg]| contact((0.0, 0.0), (0.0, 0.0), heading, reach, near, segs);
+        let reach = 50.0;
+        let feel = |heading: f32, segs: &[Seg]| contact((0.0, 0.0), (0.0, 0.0), heading, reach, segs);
         // Fly at the origin facing +x; an edge along y = -20 is on its left (y down).
         let edge = [Seg { a: (-500.0, -20.0), b: (500.0, -20.0) }];
-        let ((l, r), (nl, nr)) = feel(0.0, &edge);
+        let (l, r) = feel(0.0, &edge);
         assert!(l > 0.3 && r == 0.0, "left edge: ({l}, {r})");
-        assert!(nl == 0.0 && nr == 0.0, "20 px is beyond near reach");
-        let ((l, r), _) = feel(std::f32::consts::PI, &edge);
+        let (l, r) = feel(std::f32::consts::PI, &edge);
         assert!(r > 0.3 && l == 0.0, "turned around, the edge is on the right: ({l}, {r})");
-        // Near contact rises to full at the edge.
-        let (_, (nl, _)) = feel(0.0, &[Seg { a: (-500.0, -1.0), b: (500.0, -1.0) }]);
-        assert!(nl > 0.8, "near contact at 1 px: {nl}");
         // Beyond reach: nothing.
-        assert_eq!(feel(0.0, &[Seg { a: (-500.0, -60.0), b: (500.0, -60.0) }]), ((0.0, 0.0), (0.0, 0.0)));
+        assert_eq!(feel(0.0, &[Seg { a: (-500.0, -60.0), b: (500.0, -60.0) }]), (0.0, 0.0));
         // The same short wall ahead-left vs behind-left: weaker behind.
-        let ahead = feel(0.0, &[Seg { a: (35.0, -10.0), b: (45.0, -10.0) }]).0.0;
-        let behind = feel(0.0, &[Seg { a: (-45.0, -10.0), b: (-35.0, -10.0) }]).0.0;
+        let ahead = feel(0.0, &[Seg { a: (35.0, -10.0), b: (45.0, -10.0) }]).0;
+        let behind = feel(0.0, &[Seg { a: (-45.0, -10.0), b: (-35.0, -10.0) }]).0;
         assert!(behind < 0.5 * ahead && behind > 0.0, "ahead {ahead}, behind {behind}");
         // Continuous sides: a wall dead ahead feeds neither side much, and turning a little
         // either way changes the split smoothly instead of flipping it.
         let wall = [Seg { a: (20.0, -500.0), b: (20.0, 500.0) }];
-        let ((l0, r0), _) = feel(0.0, &wall);
+        let (l0, r0) = feel(0.0, &wall);
         assert!(l0 < 0.05 && r0 < 0.05, "dead ahead: ({l0}, {r0})");
-        let ((l1, r1), _) = feel(0.05, &wall);
-        let ((l2, r2), _) = feel(-0.05, &wall);
+        let (l1, r1) = feel(0.05, &wall);
+        let (l2, r2) = feel(-0.05, &wall);
         assert!((l1 - r2).abs() < 1e-5 && (r1 - l2).abs() < 1e-5 && l1.max(r1) < 0.1);
         // Smooth: no jump near the edge of reach.
-        let at = |d: f32| feel(0.0, &[Seg { a: (-500.0, -d), b: (500.0, -d) }]).0.0;
+        let at = |d: f32| feel(0.0, &[Seg { a: (-500.0, -d), b: (500.0, -d) }]).0;
         assert!(at(49.0) < 0.01 && (at(30.0) - at(30.5)).abs() < 0.02);
         // Head ahead of the thorax, already across a line the thorax hasn't reached (heading
         // -80 deg, line at y = -5): judged from the head the line would be straight behind it
         // and vanish; judged from the thorax it's ahead and a little left, so it still counts,
         // and being nearly straight across the path, it feeds that side only a little.
         let line = [Seg { a: (-500.0, -5.0), b: (500.0, -5.0) }];
-        let ((l, r), _) = contact((0.0, 0.0), (0.0, -10.0), -1.4, reach, near, &line);
+        let (l, r) = contact((0.0, 0.0), (0.0, -10.0), -1.4, reach, &line);
         assert!(l > 0.05 && l < 0.3 && r == 0.0, "({l}, {r})");
     }
 }

@@ -39,8 +39,8 @@ pub struct Body {
     pub walk: f32,
     /// Sensing point, body units ahead of the thorax (`SENSE_AHEAD`; tests sweep it).
     pub sense_ahead: f32,
-    /// Last frame's contact, far and near, (left, right) each, 0..1, for `--debug`.
-    pub contact: ((f32, f32), (f32, f32)),
+    /// Last frame's contact (left, right), 0..1, for `--debug`.
+    pub contact: (f32, f32),
     /// How long the fly has been blocked by the work-area wall, and how long it has left to
     /// turn away from it.
     stuck_ms: f32,
@@ -49,11 +49,11 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: ((0.0, 0.0), (0.0, 0.0)), stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
     /// One frame: feel `segs`, hold that contact for all `steps` brain steps (injected into the
-    /// CONTACT and CONTACT_NEAR neurons like looming is), then move. Returns the spike count.
+    /// CONTACT neurons like looming is), then move. Returns the spike count.
     pub fn tick(
         &mut self,
         brain: &mut Brain,
@@ -66,17 +66,13 @@ impl Body {
         let unit = FLY_SCALE * scale;
         let a = self.sense_ahead * unit;
         let head = (self.x + self.heading.cos() * a, self.y + self.heading.sin() * a);
-        self.contact = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, world::NEAR_REACH * unit, segs);
-        let ((fl, fr), (nl, nr)) = self.contact;
-        let drive: Vec<(Vec<u32>, f32)> = [("CONTACT_left", fl), ("CONTACT_right", fr), ("CONTACT_NEAR_left", nl), ("CONTACT_NEAR_right", nr)]
-            .into_iter()
-            .map(|(group, c)| (brain.pack.sensory(group).to_vec(), CONTACT_MV * c))
-            .collect();
+        self.contact = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, segs);
+        let left = brain.pack.sensory("CONTACT_left").to_vec();
+        let right = brain.pack.sensory("CONTACT_right").to_vec();
         let mut spikes = 0;
         for _ in 0..steps {
-            for (group, mv) in &drive {
-                brain.inject(group, *mv);
-            }
+            brain.inject(&left, CONTACT_MV * self.contact.0);
+            brain.inject(&right, CONTACT_MV * self.contact.1);
             spikes += brain.step();
         }
         self.update(brain, steps as f32, scale, inside, home);
@@ -322,12 +318,12 @@ mod tests {
         trial(t, seed, start, &border(&[work]), work, 3.0, |b| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
     }
 
-    /// Passes out of 6 seeds for: shallow 20 deg, shallow 30 deg, steep, border, corner; and the
+    /// Passes out of `seeds` for: shallow 20 deg, shallow 30 deg, steep, border, corner; and the
     /// fastest turn in any passing trial, deg/s.
-    fn score(t: &Setup) -> ([u32; 5], f32) {
+    fn score(t: &Setup, seeds: u64) -> ([u32; 5], f32) {
         let mut fastest = 0.0_f32;
         let mut count = |f: &dyn Fn(u64) -> (bool, f32)| {
-            (1..=6)
+            (1..=seeds)
                 .filter(|&s| {
                     let (ok, turn) = f(s);
                     if ok {
@@ -347,39 +343,38 @@ mod tests {
         (s, fastest)
     }
 
-    /// The acceptance bar on the shipped stub pack: every scenario in at least 5 of 6 seeds,
+    /// The acceptance bar on the shipped stub pack: every scenario in at least 10 of 12 seeds,
     /// no spins.
     #[test]
     fn edge_following() {
-        let (s, fastest) = score(&Setup { pack: STUB, ahead: SENSE_AHEAD });
-        println!("shallow 20 {}/6, shallow 30 {}/6, steep {}/6, border {}/6, corner {}/6, fastest turn {fastest:.0} deg/s", s[0], s[1], s[2], s[3], s[4]);
-        assert!(s.iter().all(|&n| n >= 5), "edge following: {s:?}");
+        let (s, fastest) = score(&Setup { pack: STUB, ahead: SENSE_AHEAD }, 12);
+        println!("shallow 20 {}/12, shallow 30 {}/12, steep {}/12, border {}/12, corner {}/12, fastest turn {fastest:.0} deg/s", s[0], s[1], s[2], s[3], s[4]);
+        assert!(s.iter().all(|&n| n >= 10), "edge following: {s:?}");
     }
 
-    /// The far x near weight sweep. Packs come from `extract/make_stub_pack.py` with
-    /// `w_contact_dn` / `w_contact_near_dn` overridden, named `f<far>_n<near>.fbp`, in the
+    /// The CONTACT weight sweep, 6 seeds (12 with `FLIT_SEEDS=12`). Packs come from
+    /// `extract/make_stub_pack.py` with `w_contact_dn` overridden, named `w<weight>.fbp`, in the
     /// directory `FLIT_SWEEP`. Run:
     /// `FLIT_SWEEP=<dir> cargo test --release sweep_contact -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn sweep_contact() {
-        let dir = std::env::var("FLIT_SWEEP").expect("FLIT_SWEEP=<dir of f*_n*.fbp>");
-        let mut packs: Vec<((f32, f32), std::path::PathBuf)> = std::fs::read_dir(dir)
+        let dir = std::env::var("FLIT_SWEEP").expect("FLIT_SWEEP=<dir of w*.fbp>");
+        let seeds: u64 = std::env::var("FLIT_SEEDS").map_or(6, |s| s.parse().unwrap());
+        let mut packs: Vec<(f32, std::path::PathBuf)> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| {
                 let p = e.ok()?.path();
-                let (f, n) = p.file_stem()?.to_str()?.strip_prefix('f')?.split_once("_n")?;
-                Some(((f.parse().ok()?, n.parse().ok()?), p))
+                Some((p.file_stem()?.to_str()?.strip_prefix('w')?.parse().ok()?, p))
             })
             .collect();
-        packs.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then(a.0.1.total_cmp(&b.0.1)));
-        println!("| ahead | far | near | shallow 20 | shallow 30 | steep | border | corner | fastest turn deg/s |");
-        println!("|---|---|---|---|---|---|---|---|---|");
-        for ahead in [11.0, 20.0] {
-            for ((f, n), p) in &packs {
-                let (s, fastest) = score(&Setup { pack: &std::fs::read(p).unwrap(), ahead });
-                println!("| {ahead} | {f} | {n} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 | {fastest:.0} |", s[0], s[1], s[2], s[3], s[4]);
-            }
+        packs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        println!("| w_contact_dn | shallow 20 | shallow 30 | steep | border | corner | fastest turn deg/s |");
+        println!("|---|---|---|---|---|---|---|");
+        for (w, p) in packs {
+            let (s, fastest) = score(&Setup { pack: &std::fs::read(p).unwrap(), ahead: SENSE_AHEAD }, seeds);
+            let n = |i: usize| format!("{}/{seeds}", s[i]);
+            println!("| {w} | {} | {} | {} | {} | {} | {fastest:.0} |", n(0), n(1), n(2), n(3), n(4));
         }
     }
 }
