@@ -16,8 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// Nose to abdomen tip, in body units (see `fly.rs`).
 pub const BODY_LENGTH: f32 = 37.0;
-/// How far the fly feels, from the thorax, in body units: ~1.2 body lengths.
+/// How far the fly feels, from the thorax, in body units: ~1.2 body lengths (far contact,
+/// turns toward the edge) and ~0.3 (near contact, turns away).
 pub const REACH: f32 = 1.2 * BODY_LENGTH;
+pub const NEAR_REACH: f32 = 0.3 * BODY_LENGTH;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -74,6 +76,41 @@ fn uncovered(s: Seg, cover: &[Rect]) -> Vec<Seg> {
         .collect()
 }
 
+/// The parts of `s` inside the union of `rects` (closed), merged.
+fn covered(s: Seg, rects: &[Rect]) -> Vec<Seg> {
+    let horizontal = s.a.1 == s.b.1;
+    let (fixed, lo, hi) =
+        if horizontal { (s.a.1, s.a.0.min(s.b.0), s.a.0.max(s.b.0)) } else { (s.a.0, s.a.1.min(s.b.1), s.a.1.max(s.b.1)) };
+    let mut parts: Vec<(f32, f32)> = rects
+        .iter()
+        .filter_map(|r| {
+            let (across, along) = if horizontal { ((r.t, r.b), (r.l, r.r)) } else { ((r.l, r.r), (r.t, r.b)) };
+            let (a, b) = (lo.max(along.0), hi.min(along.1));
+            (fixed >= across.0 && fixed <= across.1 && b > a).then_some((a, b))
+        })
+        .collect();
+    parts.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut merged: Vec<(f32, f32)> = vec![];
+    for (a, b) in parts {
+        match merged.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(a, b)| if horizontal { Seg { a: (a, fixed), b: (b, fixed) } } else { Seg { a: (fixed, a), b: (fixed, b) } })
+        .collect()
+}
+
+/// Everything the fly can feel: visible window edges, clipped to the work areas (a frame poking
+/// into the taskbar strip doesn't count), plus the work-area border.
+pub fn feelable(rects: &[Rect], work: &[Rect]) -> Vec<Seg> {
+    let mut segs: Vec<Seg> = visible_edges(rects).into_iter().flat_map(|s| covered(s, work)).collect();
+    segs.extend(border(work));
+    segs
+}
+
 /// Visible window edges. `rects` are in z-order, topmost first (as EnumWindows returns them):
 /// each window's sides are clipped against every window above it.
 pub fn visible_edges(rects: &[Rect]) -> Vec<Seg> {
@@ -108,28 +145,35 @@ fn nearest(s: &Seg, p: (f32, f32)) -> (f32, f32) {
     (s.a.0 + t * dx, s.a.1 + t * dy)
 }
 
-/// What the fly feels: (left, right), each 0..1. Per segment, the nearest point: strength falls
-/// off smoothly with distance (smoothstep, 1 at the thorax, 0 at `reach` px, no hard edge to
-/// twitch at), full ahead and beside, fading to 0 directly behind. Side is the sign of
-/// heading x (vector to the point); y points down, so negative = the fly's left. Summed per
-/// side, clamped.
-pub fn contact(x: f32, y: f32, heading: f32, reach: f32, segs: &[Seg]) -> (f32, f32) {
+/// Smooth 0..1: 1 at distance 0, 0 at `reach` and beyond (smoothstep, no hard edge to twitch at).
+fn falloff(d: f32, reach: f32) -> f32 {
+    let u = (1.0 - d / reach).max(0.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// What the fly feels, far and near: ((left, right), (left, right)), each 0..1. Per segment,
+/// its nearest point: strength falls off smoothly with distance (`reach` far, `near_reach`
+/// near), and is split between the sides by the sine of the point's bearing from the heading,
+/// so an edge dead ahead feeds neither side much and nothing flips as the bearing sweeps
+/// round. Full ahead and beside, fading to 0 directly behind. Summed per side, clamped.
+pub fn contact(x: f32, y: f32, heading: f32, reach: f32, near_reach: f32, segs: &[Seg]) -> ((f32, f32), (f32, f32)) {
     let (hx, hy) = (heading.cos(), heading.sin());
-    let (mut l, mut r) = (0.0_f32, 0.0_f32);
+    let (mut far, mut near) = ((0.0_f32, 0.0_f32), (0.0_f32, 0.0_f32));
     for s in segs {
         let p = nearest(s, (x, y));
         let (dx, dy) = (p.0 - x, p.1 - y);
         let d = dx.hypot(dy);
-        if d >= reach {
+        if d >= reach || d < 1e-6 {
             continue;
         }
-        let u = 1.0 - d / reach;
-        let near = u * u * (3.0 - 2.0 * u);
-        let ahead = if d > 1e-6 { (hx * dx + hy * dy) / d } else { 1.0 };
-        let w = near * (1.0 + ahead).min(1.0);
-        if hx * dy - hy * dx < 0.0 { l += w } else { r += w }
+        let (cos, sin) = ((hx * dx + hy * dy) / d, (hx * dy - hy * dx) / d); // y down: sin > 0 = right
+        let ahead = (1.0 + cos).min(1.0);
+        let (l, r) = ((-sin).max(0.0) * ahead, sin.max(0.0) * ahead);
+        let (f, n) = (falloff(d, reach), falloff(d, near_reach));
+        far = (far.0 + f * l, far.1 + f * r);
+        near = (near.0 + n * l, near.1 + n * r);
     }
-    (l.min(1.0), r.min(1.0))
+    ((far.0.min(1.0), far.1.min(1.0)), (near.0.min(1.0), near.1.min(1.0)))
 }
 
 // --- Win32 ----------------------------------------------------------------------------------
@@ -223,8 +267,7 @@ pub fn poll(own: HWND) -> World {
     let _ = unsafe { EnumWindows(Some(collect_window), LPARAM(&mut hwnds as *mut _ as isize)) };
     let (hwnds, rects): (Vec<HWND>, Vec<Rect>) = hwnds.into_iter().filter_map(|h| Some((h, frame_of(h, own)?))).unzip();
     let work = work_areas();
-    let mut segs = visible_edges(&rects);
-    segs.extend(border(&work));
+    let segs = feelable(&rects, &work);
     World { rects, hwnds, work, segs, poll_ms: t.elapsed().as_secs_f32() * 1000.0 }
 }
 
@@ -329,22 +372,46 @@ mod tests {
     }
 
     #[test]
+    fn window_edges_clip_to_work_area() {
+        // A frame poking 2 px below the work area into the taskbar strip: its bottom side goes,
+        // its left and right sides stop at the work area's edge.
+        let work = [rect(0.0, 0.0, 1920.0, 1020.0)];
+        let segs = feelable(&[rect(229.0, 500.0, 1772.0, 1022.0)], &work);
+        let windows = &segs[..segs.len() - 4]; // the rest is the border
+        assert_eq!(total(windows), (1772.0 - 229.0) + 2.0 * 520.0, "{windows:?}");
+        assert!(windows.iter().all(|s| s.a.1 <= 1020.0 && s.b.1 <= 1020.0));
+    }
+
+    #[test]
     fn contact_sides_reach_and_behind() {
-        let reach = 50.0;
+        let (reach, near) = (50.0, 12.0);
+        let feel = |heading: f32, segs: &[Seg]| contact(0.0, 0.0, heading, reach, near, segs);
         // Fly at the origin facing +x; an edge along y = -20 is on its left (y down).
         let edge = [Seg { a: (-500.0, -20.0), b: (500.0, -20.0) }];
-        let (l, r) = contact(0.0, 0.0, 0.0, reach, &edge);
+        let ((l, r), (nl, nr)) = feel(0.0, &edge);
         assert!(l > 0.3 && r == 0.0, "left edge: ({l}, {r})");
-        let (l, r) = contact(0.0, 0.0, std::f32::consts::PI, reach, &edge);
+        assert!(nl == 0.0 && nr == 0.0, "20 px is beyond near reach");
+        let ((l, r), _) = feel(std::f32::consts::PI, &edge);
         assert!(r > 0.3 && l == 0.0, "turned around, the edge is on the right: ({l}, {r})");
+        // Near contact rises to full at the edge.
+        let (_, (nl, _)) = feel(0.0, &[Seg { a: (-500.0, -1.0), b: (500.0, -1.0) }]);
+        assert!(nl > 0.8, "near contact at 1 px: {nl}");
         // Beyond reach: nothing.
-        assert_eq!(contact(0.0, 0.0, 0.0, reach, &[Seg { a: (-500.0, -60.0), b: (500.0, -60.0) }]), (0.0, 0.0));
+        assert_eq!(feel(0.0, &[Seg { a: (-500.0, -60.0), b: (500.0, -60.0) }]), ((0.0, 0.0), (0.0, 0.0)));
         // The same short wall ahead-left vs behind-left: weaker behind.
-        let ahead = contact(0.0, 0.0, 0.0, reach, &[Seg { a: (35.0, -10.0), b: (45.0, -10.0) }]).0;
-        let behind = contact(0.0, 0.0, 0.0, reach, &[Seg { a: (-45.0, -10.0), b: (-35.0, -10.0) }]).0;
+        let ahead = feel(0.0, &[Seg { a: (35.0, -10.0), b: (45.0, -10.0) }]).0.0;
+        let behind = feel(0.0, &[Seg { a: (-45.0, -10.0), b: (-35.0, -10.0) }]).0.0;
         assert!(behind < 0.5 * ahead && behind > 0.0, "ahead {ahead}, behind {behind}");
+        // Continuous sides: a wall dead ahead feeds neither side much, and turning a little
+        // either way changes the split smoothly instead of flipping it.
+        let wall = [Seg { a: (20.0, -500.0), b: (20.0, 500.0) }];
+        let ((l0, r0), _) = feel(0.0, &wall);
+        assert!(l0 < 0.05 && r0 < 0.05, "dead ahead: ({l0}, {r0})");
+        let ((l1, r1), _) = feel(0.05, &wall);
+        let ((l2, r2), _) = feel(-0.05, &wall);
+        assert!((l1 - r2).abs() < 1e-5 && (r1 - l2).abs() < 1e-5 && l1.max(r1) < 0.1);
         // Smooth: no jump near the edge of reach.
-        let at = |d: f32| contact(0.0, 0.0, 0.0, reach, &[Seg { a: (-500.0, -d), b: (500.0, -d) }]).0;
+        let at = |d: f32| feel(0.0, &[Seg { a: (-500.0, -d), b: (500.0, -d) }]).0.0;
         assert!(at(49.0) < 0.01 && (at(30.0) - at(30.5)).abs() < 0.02);
     }
 }

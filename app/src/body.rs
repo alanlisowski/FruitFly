@@ -34,8 +34,8 @@ pub struct Body {
     walked: f64,
     /// Multiplier on the forward-command walking speed (`--walk-speed`); escape is unaffected.
     pub walk: f32,
-    /// Last frame's contact (left, right), 0..1, for `--debug`.
-    pub contact: (f32, f32),
+    /// Last frame's contact, far and near, (left, right) each, 0..1, for `--debug`.
+    pub contact: ((f32, f32), (f32, f32)),
     /// How long the fly has been blocked by the work-area wall, and how long it has left to
     /// turn away from it.
     stuck_ms: f32,
@@ -44,11 +44,11 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, contact: (0.0, 0.0), stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, contact: ((0.0, 0.0), (0.0, 0.0)), stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
     /// One frame: feel `segs`, hold that contact for all `steps` brain steps (injected into the
-    /// CONTACT neurons like looming is), then move. Returns the spike count.
+    /// CONTACT and CONTACT_NEAR neurons like looming is), then move. Returns the spike count.
     pub fn tick(
         &mut self,
         brain: &mut Brain,
@@ -58,13 +58,18 @@ impl Body {
         inside: impl Fn(f32, f32) -> bool,
         home: impl Fn(f32, f32) -> (f32, f32),
     ) -> usize {
-        self.contact = world::contact(self.x, self.y, self.heading, world::REACH * FLY_SCALE * scale, segs);
-        let left = brain.pack.sensory("CONTACT_left").to_vec();
-        let right = brain.pack.sensory("CONTACT_right").to_vec();
+        let unit = FLY_SCALE * scale;
+        self.contact = world::contact(self.x, self.y, self.heading, world::REACH * unit, world::NEAR_REACH * unit, segs);
+        let ((fl, fr), (nl, nr)) = self.contact;
+        let drive: Vec<(Vec<u32>, f32)> = [("CONTACT_left", fl), ("CONTACT_right", fr), ("CONTACT_NEAR_left", nl), ("CONTACT_NEAR_right", nr)]
+            .into_iter()
+            .map(|(group, c)| (brain.pack.sensory(group).to_vec(), CONTACT_MV * c))
+            .collect();
         let mut spikes = 0;
         for _ in 0..steps {
-            brain.inject(&left, CONTACT_MV * self.contact.0);
-            brain.inject(&right, CONTACT_MV * self.contact.1);
+            for (group, mv) in &drive {
+                brain.inject(group, *mv);
+            }
             spikes += brain.step();
         }
         self.update(brain, steps as f32, scale, inside, home);
@@ -218,69 +223,88 @@ mod tests {
 
     // --- Edge following, closed loop: brain + body + fixed segments, at 100% -----------------
 
-    use crate::world::{BODY_LENGTH, Rect, border};
+    use crate::world::{BODY_LENGTH, REACH, Rect, border};
 
     /// One body length in px at 100%.
     const BL: f32 = BODY_LENGTH * FLY_SCALE;
+    /// Turning faster than this is a spin, not steering: the trial fails.
+    const SPIN_DEG_S: f32 = 400.0;
 
     /// Runs a fly from `(x, y, heading)` among `segs`, walled in by `work`, 60 Hz frames of 16
-    /// brain steps, until `each(body, seconds)` returns Some(verdict) or `secs` run out (false).
-    fn trial(pack: &[u8], seed: u64, start: (f32, f32, f32), segs: &[Seg], work: Rect, secs: f32, mut each: impl FnMut(&Body, f32) -> Option<bool>) -> bool {
+    /// brain steps, until `each(body)` returns Some(verdict) or `secs` run out (false). A spin
+    /// fails it. Returns (verdict, fastest turn in deg/s).
+    fn trial(pack: &[u8], seed: u64, start: (f32, f32, f32), segs: &[Seg], work: Rect, secs: f32, mut each: impl FnMut(&Body) -> Option<bool>) -> (bool, f32) {
         let mut brain = Brain::new(Pack::parse(pack).unwrap(), seed);
         brain.warmup(3, 16);
         let mut body = Body::new((start.0, start.1));
         body.heading = start.2;
         let inside = |x: f32, y: f32| x >= work.l && x < work.r && y >= work.t && y < work.b;
         let home = |_: f32, _: f32| ((work.l + work.r) / 2.0, (work.t + work.b) / 2.0);
-        for f in 0..(secs * 60.0) as u32 {
+        let mut fastest = 0.0_f32;
+        for _ in 0..(secs * 60.0) as u32 {
             body.tick(&mut brain, 16, 1.0, segs, inside, home);
-            if let Some(v) = each(&body, f as f32 / 60.0) {
-                return v;
+            fastest = fastest.max(body.omega.abs() * 1000.0 * 180.0 / PI);
+            if fastest > SPIN_DEG_S {
+                return (false, fastest);
+            }
+            if let Some(v) = each(&body) {
+                return (v, fastest);
             }
         }
-        false
+        (false, fastest)
     }
 
     const FAR: Rect = Rect { l: -1e5, t: -1e5, r: 1e5, b: 1e5 };
     /// A window edge along y = 0, crossable.
     const EDGE: [Seg; 1] = [Seg { a: (-1e5, 0.0), b: (1e5, 0.0) }];
 
-    /// Meets the edge at a shallow angle, starting where it first feels it: after first coming
-    /// within 1 BL, it must travel 8 BL without straying more than ~1 BL (1.2) from the line,
-    /// crossing it at least twice.
-    fn follows_edge(pack: &[u8], seed: u64, deg: f32) -> bool {
-        let y0 = crate::world::REACH * FLY_SCALE;
-        let (mut on, mut path, mut crossings, mut prev) = (false, 0.0, 0, (0.0_f32, y0));
-        trial(pack, seed, (0.0, y0, -deg.to_radians()), &EDGE, FAR, 40.0, |b, _| {
-            let step = (b.x - prev.0).hypot(b.y - prev.1);
-            crossings += (on && b.y.signum() != prev.1.signum()) as u32;
-            prev = (b.x, b.y);
-            on |= b.y.abs() < BL;
-            if !on {
+    /// Runs alongside: once the fly first reaches the edge (within 0.5 BL), it must cover 8 BL
+    /// staying 0.1-1.2 BL off it on the side it came from (`off(body)`: its distance, positive
+    /// on that side), and the distance must vary (std > 0.05 BL: it corrects).
+    fn alongside(off: impl Fn(&Body) -> f32) -> impl FnMut(&Body) -> Option<bool> {
+        let (mut reached, mut path, mut prev, mut d) = (false, 0.0, None::<(f32, f32)>, vec![]);
+        move |b| {
+            let step = prev.map_or(0.0, |p: (f32, f32)| (b.x - p.0).hypot(b.y - p.1));
+            prev = Some((b.x, b.y));
+            let o = off(b);
+            reached |= o < 0.5 * BL;
+            if !reached {
                 return None;
             }
-            if b.y.abs() > 1.2 * BL {
+            if !(0.1 * BL..=1.2 * BL).contains(&o) {
                 return Some(false);
             }
             path += step;
-            (path >= 8.0 * BL).then_some(crossings >= 2)
-        })
+            d.push(o);
+            if path < 8.0 * BL {
+                return None;
+            }
+            let mean = d.iter().sum::<f32>() / d.len() as f32;
+            let std = (d.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / d.len() as f32).sqrt();
+            Some(std > 0.05 * BL)
+        }
     }
 
-    /// Meets the edge nearly head-on: must cross and carry on 2 BL beyond it.
-    fn crosses_edge(pack: &[u8], seed: u64) -> bool {
-        trial(pack, seed, (0.0, 2.0 * BL, -85f32.to_radians()), &EDGE, FAR, 10.0, |b, _| (b.y < -2.0 * BL).then_some(true))
+    /// Meets a window edge at a shallow angle, starting where it first feels it.
+    fn follows_edge(pack: &[u8], seed: u64, deg: f32) -> (bool, f32) {
+        let y0 = REACH * FLY_SCALE;
+        trial(pack, seed, (0.0, y0, -deg.to_radians()), &EDGE, FAR, 40.0, alongside(|b| b.y))
     }
 
-    /// Walks parallel to the bottom screen border, 10 px inside: must travel 8 BL along it
-    /// without getting more than 1 BL away.
-    fn follows_border(pack: &[u8], seed: u64) -> bool {
+    /// Meets it nearly head-on: must cross and carry on 2 BL beyond it.
+    fn crosses_edge(pack: &[u8], seed: u64) -> (bool, f32) {
+        let y0 = REACH * FLY_SCALE;
+        trial(pack, seed, (0.0, y0, -85f32.to_radians()), &EDGE, FAR, 10.0, |b| (b.y < -2.0 * BL).then_some(true))
+    }
+
+    /// Walks parallel to the bottom screen border, 10 px inside: follows it for 8 BL.
+    fn follows_border(pack: &[u8], seed: u64) -> (bool, f32) {
         let work = Rect { l: -1e5, t: -1e5, r: 1e5, b: 0.0 };
         let (mut path, mut prev) = (0.0, (0.0_f32, -10.0_f32));
-        trial(pack, seed, (0.0, -10.0, 0.0), &border(&[work]), work, 40.0, |b, _| {
+        trial(pack, seed, (0.0, -10.0, 0.0), &border(&[work]), work, 40.0, |b| {
             path += (b.x - prev.0).hypot(b.y - prev.1);
             prev = (b.x, b.y);
-            if b.y < -BL {
+            if b.y < -1.2 * BL {
                 return Some(false);
             }
             (path >= 8.0 * BL).then_some(true)
@@ -289,57 +313,68 @@ mod tests {
 
     /// Starts in the bottom-left corner of a screen, facing into it: must get 2 BL away from
     /// the corner within 3 s.
-    fn leaves_corner(pack: &[u8], seed: u64) -> bool {
+    fn leaves_corner(pack: &[u8], seed: u64) -> (bool, f32) {
         let work = Rect { l: 0.0, t: 0.0, r: 1200.0, b: 800.0 };
         let start = (10.0, 790.0, 135f32.to_radians());
-        trial(pack, seed, start, &border(&[work]), work, 3.0, |b, _| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
+        trial(pack, seed, start, &border(&[work]), work, 3.0, |b| (b.x.hypot(800.0 - b.y) > 2.0 * BL).then_some(true))
     }
 
-    /// Passes out of 6 seeds for each scenario: shallow 20 deg, shallow 30 deg, steep, border,
-    /// corner.
-    fn score(pack: &[u8]) -> [u32; 5] {
-        let count = |f: &dyn Fn(u64) -> bool| (1..=6).filter(|&s| f(s)).count() as u32;
-        [
+    /// Passes out of 6 seeds for: shallow 20 deg, shallow 30 deg, steep, border, corner; and the
+    /// fastest turn in any passing trial, deg/s.
+    fn score(pack: &[u8]) -> ([u32; 5], f32) {
+        let mut fastest = 0.0_f32;
+        let mut count = |f: &dyn Fn(u64) -> (bool, f32)| {
+            (1..=6)
+                .filter(|&s| {
+                    let (ok, turn) = f(s);
+                    if ok {
+                        fastest = fastest.max(turn);
+                    }
+                    ok
+                })
+                .count() as u32
+        };
+        let s = [
             count(&|s| follows_edge(pack, s, 20.0)),
             count(&|s| follows_edge(pack, s, 30.0)),
             count(&|s| crosses_edge(pack, s)),
             count(&|s| follows_border(pack, s)),
             count(&|s| leaves_corner(pack, s)),
-        ]
+        ];
+        (s, fastest)
     }
 
-    /// The acceptance bar on the shipped stub pack: follow at shallow angles and along the
-    /// border (5/6), usually cross head-on (4/6), get out of corners (5/6).
+    /// The acceptance bar on the shipped stub pack: every scenario in at least 5 of 6 seeds,
+    /// no spins.
     #[test]
     fn edge_following() {
-        let s = score(STUB);
-        println!("shallow 20 {}/6, shallow 30 {}/6, steep {}/6, border {}/6, corner {}/6", s[0], s[1], s[2], s[3], s[4]);
-        assert!(s[0] >= 5 && s[1] >= 5, "shallow edges not followed: {s:?}");
-        assert!(s[2] >= 4, "head-on edges not crossed: {s:?}");
-        assert!(s[3] >= 5, "border not followed: {s:?}");
-        assert!(s[4] >= 5, "stuck in corners: {s:?}");
+        let (s, fastest) = score(STUB);
+        println!("shallow 20 {}/6, shallow 30 {}/6, steep {}/6, border {}/6, corner {}/6, fastest turn {fastest:.0} deg/s", s[0], s[1], s[2], s[3], s[4]);
+        assert!(s.iter().all(|&n| n >= 5), "edge following: {s:?}");
     }
 
-    /// The CONTACT weight sweep. Packs come from `extract/make_stub_pack.py` with
-    /// `w_contact_dn` overridden, named `w<weight>.fbp`, in the directory `FLIT_SWEEP`. Run:
+    /// The far x near weight sweep. Packs come from `extract/make_stub_pack.py` with
+    /// `w_contact_dn` / `w_contact_near_dn` overridden, named `f<far>_n<near>.fbp`, in the
+    /// directory `FLIT_SWEEP`. Run:
     /// `FLIT_SWEEP=<dir> cargo test --release sweep_contact -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn sweep_contact() {
-        let dir = std::env::var("FLIT_SWEEP").expect("FLIT_SWEEP=<dir of w*.fbp>");
-        let mut packs: Vec<(f32, std::path::PathBuf)> = std::fs::read_dir(dir)
+        let dir = std::env::var("FLIT_SWEEP").expect("FLIT_SWEEP=<dir of f*_n*.fbp>");
+        let mut packs: Vec<((f32, f32), std::path::PathBuf)> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| {
                 let p = e.ok()?.path();
-                Some((p.file_stem()?.to_str()?.strip_prefix('w')?.parse().ok()?, p))
+                let (f, n) = p.file_stem()?.to_str()?.strip_prefix('f')?.split_once("_n")?;
+                Some(((f.parse().ok()?, n.parse().ok()?), p))
             })
             .collect();
-        packs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        println!("| w_contact_dn | shallow 20 | shallow 30 | steep crosses | border | corner |");
-        println!("|---|---|---|---|---|---|");
-        for (w, p) in packs {
-            let s = score(&std::fs::read(p).unwrap());
-            println!("| {w} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 |", s[0], s[1], s[2], s[3], s[4]);
+        packs.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then(a.0.1.total_cmp(&b.0.1)));
+        println!("| far | near | shallow 20 | shallow 30 | steep | border | corner | fastest turn deg/s |");
+        println!("|---|---|---|---|---|---|---|---|");
+        for ((f, n), p) in packs {
+            let (s, fastest) = score(&std::fs::read(p).unwrap());
+            println!("| {f} | {n} | {}/6 | {}/6 | {}/6 | {}/6 | {}/6 | {fastest:.0} |", s[0], s[1], s[2], s[3], s[4]);
         }
     }
 }

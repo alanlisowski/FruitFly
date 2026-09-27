@@ -42,6 +42,7 @@ DEFAULTS = {
     "w_epg_pfl2": 14, "w_pfl2_dn": 30,
     "w_loom_turn": 14,
     "w_contact_dn": 20,
+    "w_contact_near_dn": 20,
 }
 
 # Same conversion the real extractor uses, so stub weights and measured weights
@@ -241,6 +242,17 @@ def build(P=None):
     for c in contact_r:
         for d in dna02_r:
             connect(c, d, P["w_contact_dn"])
+    # CONTACT_NEAR: the same touch at close range (~0.3 body lengths), wired CROSSED, so the
+    # fly turns away from an edge it's almost on. Far pulls in, near pushes out: together they
+    # hold the fly a little way off the edge, alongside it (a Braitenberg wall follower).
+    near_l = [add("CONTACT_NEAR", "left", "ACH", "mechanosensory") for _ in range(4)]
+    near_r = [add("CONTACT_NEAR", "right", "ACH", "mechanosensory") for _ in range(4)]
+    for c in near_l:
+        for d in dna02_r:
+            connect(c, d, P["w_contact_near_dn"])
+    for c in near_r:
+        for d in dna02_l:
+            connect(c, d, P["w_contact_near_dn"])
 
     motor = defaultdict(lambda: {"left": [], "right": [], "other": []})
 
@@ -266,6 +278,8 @@ def build(P=None):
         "HSE_right": hs_r,
         "CONTACT_left": contact_l,
         "CONTACT_right": contact_r,
+        "CONTACT_NEAR_left": near_l,
+        "CONTACT_NEAR_right": near_r,
         "EPG": [i for w in epg for i in w],
     }
 
