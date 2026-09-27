@@ -3,12 +3,13 @@ package ai.flybrain;
 import java.nio.file.Path;
 
 /**
- * Entry point. Three modes:
+ * Entry point. Four modes:
  *
  * <pre>
  *   java -cp out ai.flybrain.Main serve  data/brain.fbp [port]
  *   java -cp out ai.flybrain.Main bench  data/brain.fbp
  *   java -cp out ai.flybrain.Main verify data/brain.fbp
+ *   java -cp out ai.flybrain.Main trace  data/brain_stub.fbp > app/tests/golden/stub_trace.txt
  * </pre>
  *
  * <p>{@code verify} runs the same four behavioural checks as the Python
@@ -20,18 +21,21 @@ public final class Main {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("usage: Main <serve|bench|verify> <pack.fbp> [port]");
+            System.err.println("usage: Main <serve|bench|verify|trace> <pack.fbp> [port]");
             System.exit(2);
         }
         String mode = args[0];
         CircuitPack pack = CircuitPack.load(Path.of(args[1]));
-        System.out.printf("loaded %s: %,d neurons, %,d edges%n",
-                args[1], pack.neuronCount, pack.edgeCount);
+        if (!mode.equals("trace")) {   // trace output is data, nothing else on stdout
+            System.out.printf("loaded %s: %,d neurons, %,d edges%n",
+                    args[1], pack.neuronCount, pack.edgeCount);
+        }
 
         switch (mode) {
             case "serve" -> serve(pack, args.length > 2 ? Integer.parseInt(args[2]) : 8787);
             case "bench" -> bench(pack);
             case "verify" -> verify(pack);
+            case "trace" -> trace(pack);
             default -> {
                 System.err.println("unknown mode: " + mode);
                 System.exit(2);
@@ -83,6 +87,34 @@ public final class Main {
         System.out.printf("  ~%,.0f edge updates per ms%n",
                 spikes / (double) steps * edgesPerSpike);
         System.out.printf("  headroom at 1 kHz: %.0fx%n", steps / elapsed / 1000.0);
+    }
+
+    /**
+     * Golden trace for the Rust port (app/tests/brain.rs): noise off, warmup(3, 16), then
+     * 3000 steps of a fixed protocol -- rest, left PEN drive, rest, right PEN drive, rest,
+     * a looming ramp, rest -- printing every spike as "step neuron". The port must reproduce
+     * it exactly. Change the protocol here and in the Rust test together.
+     */
+    private static void trace(CircuitPack pack) {
+        LifBrain b = new LifBrain(pack, 1);
+        b.setNoiseMv(0f);
+        b.warmup(3, 16);
+        int[] penL = pack.byType("PEN_a", "left"), penR = pack.byType("PEN_a", "right");
+        int[] lplc2 = pack.sensoryIndices("LPLC2"), lc4 = pack.sensoryIndices("LC4");
+        StringBuilder out = new StringBuilder();
+        for (int t = 0; t < 3000; t++) {
+            if (t >= 500 && t < 1000) b.inject(penL, 9f);
+            if (t >= 1200 && t < 1700) b.inject(penR, 9f);
+            if (t >= 2000 && t < 2300) {
+                float drive = 16f * ((t - 2000) / 300f) * ((t - 2000) / 300f);
+                b.inject(lplc2, drive);
+                b.inject(lc4, drive * 0.7f);
+            }
+            int ns = b.step();
+            int[] s = b.lastSpikes();
+            for (int k = 0; k < ns; k++) out.append(t).append(' ').append(s[k]).append('\n');
+        }
+        System.out.print(out);
     }
 
     // ------------------------------------------------------------------------

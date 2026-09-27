@@ -2,20 +2,24 @@
 #![windows_subsystem = "windows"]
 
 mod art;
+mod body;
 mod fly;
 mod path;
 mod snapshot;
 
+use body::Body;
+use flit::brain::{Brain, Pack};
 use fly::{Feet, FlyPose};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, Pixmap};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
     SelectObject,
 };
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -208,6 +212,88 @@ fn screen_center() -> (f32, f32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN) as f32 / 2.0, GetSystemMetrics(SM_CYSCREEN) as f32 / 2.0) }
 }
 
+/// Work area (monitor minus taskbar) of the monitor under `(x, y)`, or with `nearest`, of the
+/// monitor closest to it.
+fn work_area(x: f32, y: f32, nearest: bool) -> Option<RECT> {
+    let flags = if nearest { MONITOR_DEFAULTTONEAREST } else { MONITOR_DEFAULTTONULL };
+    let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: plain FFI getters; `mi` is a valid, sized out-param.
+    let ok = unsafe {
+        let m = MonitorFromPoint(POINT { x: x.floor() as i32, y: y.floor() as i32 }, flags);
+        !m.is_invalid() && GetMonitorInfoW(m, &mut mi).as_bool()
+    };
+    ok.then_some(mi.rcWork)
+}
+
+/// Is this screen point on some monitor's work area?
+fn on_work_area(x: f32, y: f32) -> bool {
+    work_area(x, y, false)
+        .is_some_and(|r| x >= r.left as f32 && x < r.right as f32 && y >= r.top as f32 && y < r.bottom as f32)
+}
+
+/// Centre of the work area nearest to `(x, y)`.
+fn work_area_centre(x: f32, y: f32) -> (f32, f32) {
+    let r = work_area(x, y, true).unwrap_or_default();
+    ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0)
+}
+
+/// What moves the fly: the brain, or (`--demo-path`) milestone 2's figure-eight.
+enum Driver {
+    Brain {
+        brain: Brain,
+        body: Body,
+        /// Brain time owed to the clock, ms (< 1 after each frame).
+        owed_ms: f32,
+        /// `--debug`: (brain ms, spikes) since the last print.
+        debug: Option<(u32, usize)>,
+    },
+    Demo(path::Walker, path::Step),
+}
+
+impl Driver {
+    /// Longest brain catch-up in one frame. A long stall (sleep, a stuck frame) must not make
+    /// one frame simulate seconds of brain; the excess is dropped.
+    const MAX_STEPS: u32 = 50;
+
+    fn advance(&mut self, dt: f32, scale: f32) {
+        match self {
+            Driver::Brain { brain, body, owed_ms, debug } => {
+                *owed_ms += dt * 1000.0;
+                let steps = (*owed_ms as u32).min(Self::MAX_STEPS);
+                *owed_ms = (*owed_ms - steps as f32).min(0.999);
+                let mut spikes = 0;
+                for _ in 0..steps {
+                    spikes += brain.step();
+                }
+                body.update(brain, steps as f32, scale, on_work_area, work_area_centre);
+                if let Some((ms, n)) = debug {
+                    (*ms, *n) = (*ms + steps, *n + spikes);
+                    if *ms >= 500 {
+                        let (angle, mag) = brain.bump();
+                        println!(
+                            "turn {:+7.1}  fwd {:6.1}  bump {:+5.0} deg  mag {:.2}  {:5.0} spikes/s",
+                            brain.turn_command(),
+                            brain.forward_command(),
+                            angle.to_degrees(),
+                            mag,
+                            *n as f32 * 1000.0 / *ms as f32
+                        );
+                        (*ms, *n) = (0, 0);
+                    }
+                }
+            }
+            Driver::Demo(walker, step) => *step = walker.step(dt),
+        }
+    }
+
+    fn pose(&self, scale: f32) -> FlyPose {
+        match self {
+            Driver::Brain { body, .. } => body.pose(scale),
+            Driver::Demo(_, step) => to_pose(step, scale, screen_center()),
+        }
+    }
+}
+
 /// Converts the walker's logical-pixel output (96 dpi, relative to the route's centre) into a
 /// pose in physical screen pixels.
 fn to_pose(s: &path::Step, scale: f32, center: (f32, f32)) -> FlyPose {
@@ -224,6 +310,11 @@ fn main() {
     // `flit --snapshot <dir>`: render the reference images and exit, no window. A windows-
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    if flag("--debug") || flag("--pack") {
+        // SAFETY: plain FFI call; failing just means there is no parent console to print to.
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
     if args.get(1).map(String::as_str) == Some("--snapshot") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
@@ -233,6 +324,17 @@ fn main() {
         }
         return;
     }
+
+    let pack = match args.iter().position(|a| a == "--pack") {
+        Some(i) => match args.get(i + 1).ok_or("--pack needs a path".to_owned()).and_then(|p| Pack::load(p.as_ref())) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("flit: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => Pack::parse(flit::brain::STUB).expect("embedded pack"),
+    };
 
     // SAFETY: plain FFI call with a constant. Must be the FIRST thing we do, before any window
     // exists; otherwise Windows "virtualises" our coordinates on scaled displays (125%, 150%...)
@@ -290,11 +392,18 @@ fn main() {
     };
 
     let mut scale = dpi_scale(hwnd);
-    let mut center = screen_center();
     let mut canvas = Canvas::new(scale);
-    let mut walker = path::Walker::new();
-    let mut step = walker.step(0.0);
-    let mut pose = to_pose(&step, scale, center);
+    let mut driver = if flag("--demo-path") {
+        let mut walker = path::Walker::new();
+        let step = walker.step(0.0);
+        Driver::Demo(walker, step)
+    } else {
+        let mut brain = Brain::new(pack, 1);
+        brain.warmup(3, 16);
+        let debug = flag("--debug").then_some((0, 0));
+        Driver::Brain { brain, body: Body::new(work_area_centre(0.0, 0.0)), owed_ms: 0.0, debug }
+    };
+    let mut pose = driver.pose(scale);
     let mut feet = Feet::new(&pose, scale);
     canvas.present(hwnd, &pose, &feet, scale);
     // SW_SHOWNOACTIVATE: show without activating. Plain SW_SHOW would steal focus.
@@ -338,9 +447,8 @@ fn main() {
         let mut redraw = DPI_CHANGED.swap(false, Ordering::Relaxed);
         if redraw {
             scale = dpi_scale(hwnd);
-            center = screen_center();
             canvas = Canvas::new(scale);
-            pose = to_pose(&step, scale, center);
+            pose = driver.pose(scale);
             feet = Feet::new(&pose, scale); // feet are pinned in screen pixels: re-pin at the new scale
         }
 
@@ -355,8 +463,8 @@ fn main() {
         if now >= next_frame {
             // Motion is driven by real elapsed running time, not by counting frames, so a
             // dropped frame doesn't change the fly's speed (see `Clock`).
-            step = walker.step(clock.tick(now));
-            pose = to_pose(&step, scale, center);
+            driver.advance(clock.tick(now), scale);
+            pose = driver.pose(scale);
             feet.update(&pose, scale);
             redraw = true;
             next_frame += FRAME;
@@ -409,6 +517,63 @@ mod tests {
 
         let (a, b) = (fly.step(0.0), steady.step(0.0));
         assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "fly jumped ahead");
+    }
+
+    fn brain_driver() -> Driver {
+        let mut brain = Brain::new(Pack::parse(flit::brain::STUB).unwrap(), 1);
+        brain.warmup(3, 16);
+        Driver::Brain { brain, body: Body::new(work_area_centre(0.0, 0.0)), owed_ms: 0.0, debug: None }
+    }
+
+    /// Five simulated minutes on this machine's real monitors at 60 Hz: the pose stays finite
+    /// and on a work area. Then a 30 s pause: the first frame after Resume moves the fly by at
+    /// most one frame's worth, and a 10 s stall costs at most `MAX_STEPS` of brain time.
+    /// Prints what the fly did, for eyeballing.
+    #[test]
+    fn brain_drives_cleanly_through_pause_and_stall() {
+        let scale = 1.25;
+        let (mut d, t0) = (brain_driver(), Instant::now());
+        let (mut clock, mut now) = (Clock { last: t0, paused: false }, t0);
+        let frame = Duration::from_micros(16_667);
+        let (mut walked, mut turned, mut still, mut bounces) = (0.0_f32, 0.0_f32, 0, 0);
+        let mut prev = d.pose(scale);
+        for _ in 0..60 * 300 {
+            now += frame;
+            d.advance(clock.tick(now), scale);
+            let p = d.pose(scale);
+            assert!(p.x.is_finite() && p.y.is_finite() && p.heading.is_finite() && p.gait_phase.is_finite());
+            assert!(on_work_area(p.x, p.y), "fly left the work area at ({}, {})", p.x, p.y);
+            let step = (p.x - prev.x).hypot(p.y - prev.y);
+            walked += step;
+            still += (step < 0.05 * scale) as u32;
+            let dh = p.heading - prev.heading;
+            let dh = dh.sin().atan2(dh.cos());
+            turned += dh.abs();
+            bounces += (dh.abs() > 0.01 && step < 0.5 * scale && p.speed > 5.0) as u32;
+            prev = p;
+        }
+        println!(
+            "5 min: walked {:.0} px ({:.0} px/s), turned {:.0} deg total, still {:.0}% of frames, ~{bounces} edge frames",
+            walked, walked / 300.0, turned.to_degrees(), still as f32 / 180.0
+        );
+
+        clock.set_paused(true, now);
+        now += Duration::from_secs(30);
+        clock.set_paused(false, now);
+        now += frame;
+        d.advance(clock.tick(now), scale);
+        let p = d.pose(scale);
+        let jump = (p.x - prev.x).hypot(p.y - prev.y);
+        assert!(p.x.is_finite() && jump < 0.5 * 16.7 * scale, "resume jumped {jump} px");
+
+        // A stall: the clock caps it at 0.1 s, the driver at 50 brain steps.
+        let Driver::Brain { owed_ms, .. } = &d else { unreachable!() };
+        let owed = *owed_ms;
+        d.advance(10.0, scale);
+        let Driver::Brain { owed_ms, .. } = &d else { unreachable!() };
+        assert!(owed < 1.0 && *owed_ms < 1.0, "excess brain time not dropped");
+        let q = d.pose(scale);
+        assert!((q.x - p.x).hypot(q.y - p.y) < 0.5 * 50.0 * scale, "stall moved the fly too far");
     }
 
     /// Channel order is the silent bug: red must stay red. tiny-skia RGBA [R,G,B,A] in,
