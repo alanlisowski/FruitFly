@@ -306,7 +306,7 @@ fn main() {
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    if flag("--debug") || flag("--pack") {
+    if flag("--debug") || flag("--pack") || flag("--walk-speed") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -329,6 +329,17 @@ fn main() {
             }
         },
         None => Pack::parse(flit::brain::STUB).expect("embedded pack"),
+    };
+
+    let walk = match args.iter().position(|a| a == "--walk-speed") {
+        None => fly::WALK_SPEED,
+        Some(i) => match args.get(i + 1).and_then(|v| v.parse::<f32>().ok()) {
+            Some(v) if (0.3..=1.5).contains(&v) => v,
+            _ => {
+                eprintln!("flit: --walk-speed needs a number from 0.3 to 1.5 (default {})", fly::WALK_SPEED);
+                std::process::exit(1);
+            }
+        },
     };
 
     // SAFETY: plain FFI call with a constant. Must be the FIRST thing we do, before any window
@@ -390,13 +401,16 @@ fn main() {
     let mut canvas = Canvas::new(scale);
     let mut driver = if flag("--demo-path") {
         let mut walker = path::Walker::new();
+        walker.walk = walk as f64;
         let step = walker.step(0.0);
         Driver::Demo(walker, step)
     } else {
         let mut brain = Brain::new(pack, 1);
         brain.warmup(3, 16);
         let debug = flag("--debug").then_some((0, 0));
-        Driver::Brain { brain, body: Body::new(work_area_centre(0.0, 0.0)), owed_ms: 0.0, debug }
+        let mut body = Body::new(work_area_centre(0.0, 0.0));
+        body.walk = walk;
+        Driver::Brain { brain, body, owed_ms: 0.0, debug }
     };
     let mut pose = driver.pose(scale);
     let mut feet = Feet::new(&pose, scale);

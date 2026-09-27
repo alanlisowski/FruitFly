@@ -4,7 +4,7 @@
 //! *logical* pixels (96 dpi); `main` scales to physical pixels, so a DPI change never
 //! changes where the fly is along its route or how fast it walks.
 
-use crate::fly::{CYCLE, FLY_SCALE, SPEED_SCALE};
+use crate::fly::{CYCLE, FLY_SCALE, SPEED_SCALE, WALK_SPEED};
 use std::f64::consts::TAU;
 
 // Figure-eight (lemniscate of Gerono): x = A sin t, y = (B/2) sin 2t. 600 wide, 100 tall each side.
@@ -40,6 +40,8 @@ pub struct Walker {
     stop: f64,
     dwell: f32,
     speed: f32,
+    /// Multiplier on cruising speed (`--walk-speed`).
+    pub walk: f64,
     /// `cum[i]` = arc length of the loop from t = 0 to t = i * TAU / N. Lets us turn "distance
     /// walked" into the curve parameter t (a figure-eight isn't parametrised by distance).
     cum: Vec<f64>,
@@ -58,7 +60,7 @@ impl Walker {
             let (a, b) = (pt(i - 1), pt(i));
             cum.push(cum[i - 1] + (b.0 - a.0).hypot(b.1 - a.1));
         }
-        let mut w = Walker { d: 0.0, leave: 0.0, stop: 0.0, dwell: 0.0, speed: 0.0, cum };
+        let mut w = Walker { d: 0.0, leave: 0.0, stop: 0.0, dwell: 0.0, speed: 0.0, walk: WALK_SPEED as f64, cum };
         w.stop = w.next_stop(0.0);
         w
     }
@@ -95,7 +97,7 @@ impl Walker {
         } else {
             // Slow/fast sections: two slow-fast waves per lap, 30..230 px/s before SPEED.
             let u = self.d.rem_euclid(self.lap()) / self.lap();
-            let cruise = (130.0 + 100.0 * (TAU * 2.0 * u).sin()) * SPEED;
+            let cruise = (130.0 + 100.0 * (TAU * 2.0 * u).sin()) * SPEED * self.walk;
             // Never faster than we can brake to the next stop, or than we can have sped up.
             let brake = (2.0 * ACCEL * (self.stop - self.d)).max(0.0).sqrt();
             let launch = START_SPEED + (2.0 * ACCEL * (self.d - self.leave)).sqrt();
@@ -181,6 +183,7 @@ mod tests {
         }
         println!("worst planted-foot slip: {worst_slip} px/frame, stops: {stops}, lap {} px", w.lap());
         assert!(worst_slip < 0.01, "feet skate: {worst_slip} px in one frame");
-        assert!((4..=8).contains(&stops), "expected ~1 stop/lap, got {stops}");
+        let laps = w.d / w.lap();
+        assert!(stops >= 2 && (stops as f64 - laps).abs() <= 1.5, "expected ~1 stop/lap, got {stops} in {laps:.1} laps");
     }
 }

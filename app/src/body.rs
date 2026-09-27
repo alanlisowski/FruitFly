@@ -2,7 +2,7 @@
 //! a scale factor plus a first-order lag, nothing more; the one exception is the escape latch,
 //! standing in for the ventral nerve cord the brain doesn't have.
 
-use crate::fly::{CYCLE, FLY_SCALE, FlyPose, SPEED_SCALE};
+use crate::fly::{CYCLE, FLY_SCALE, FlyPose, SPEED_SCALE, WALK_SPEED};
 use flit::brain::Brain;
 use std::f32::consts::PI;
 
@@ -21,11 +21,13 @@ pub struct Body {
     escape_latch: f32,
     /// Logical px walked (f64: hours of walking must not cost precision, see `path.rs`).
     walked: f64,
+    /// Multiplier on the forward-command walking speed (`--walk-speed`); escape is unaffected.
+    pub walk: f32,
 }
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED }
     }
 
     /// Advances `dt_ms` of brain time. `inside(x, y)`: is this screen point on some monitor's
@@ -54,7 +56,7 @@ impl Body {
         let startled = !frozen && jump > 25.0;
 
         let target_omega = turn * 0.00013;
-        let mut target_speed = fwd * 0.00085 + escape * 0.0042 + if running { 0.22 * (self.escape_latch / 420.0) } else { 0.0 };
+        let mut target_speed = fwd * 0.00085 * self.walk + escape * 0.0042 + if running { 0.22 * (self.escape_latch / 420.0) } else { 0.0 };
         if frozen {
             target_speed = 0.0;
         }
@@ -162,6 +164,6 @@ mod tests {
             "walking {walking:.0} px/s -> {hz:.1} steps/s; escape peak {fleeing:.0} px/s -> {:.1} steps/s ({cycle_px:.2} px per cycle)",
             fleeing / cycle_px
         );
-        assert!(hz <= 15.0, "legs step {hz:.1} times a second while walking");
+        assert!(hz <= 11.0, "legs step {hz:.1} times a second while walking");
     }
 }
