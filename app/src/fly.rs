@@ -12,7 +12,7 @@ pub const FLY_SCALE: f32 = 1.3;
 pub const SPEED_SCALE: f32 = FLY_SCALE / 1.9;
 /// Default multiplier on normal walking speed only (not escape), so the legs step slowly
 /// enough to follow by eye. `--walk-speed <factor>` overrides it at runtime.
-pub const WALK_SPEED: f32 = 0.7;
+pub const WALK_SPEED: f32 = 0.5;
 
 // --- Gait ---------------------------------------------------------------------------------
 // One gait cycle per leg = STANCE (foot on the ground, moving backward relative to the body)

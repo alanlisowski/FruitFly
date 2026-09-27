@@ -6,7 +6,7 @@ the old hardcoded route (`path.rs`).
 
 ```
 cargo run --release
-cargo run --release -- --walk-speed 0.9     # walking speed factor, 0.3..1.5 (default 0.7); escape unaffected
+cargo run --release -- --walk-speed 0.9     # walking speed factor, 0.3..1.5 (default 0.5); escape unaffected
 cargo run --release -- --demo-path          # the old figure-eight route instead of the brain
 cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second
 cargo run --release -- --pack <file.fbp>    # load another brain pack instead of the embedded stub

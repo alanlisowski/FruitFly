@@ -164,6 +164,6 @@ mod tests {
             "walking {walking:.0} px/s -> {hz:.1} steps/s; escape peak {fleeing:.0} px/s -> {:.1} steps/s ({cycle_px:.2} px per cycle)",
             fleeing / cycle_px
         );
-        assert!(hz <= 11.0, "legs step {hz:.1} times a second while walking");
+        assert!(hz <= 8.0, "legs step {hz:.1} times a second while walking");
     }
 }
