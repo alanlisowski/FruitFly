@@ -8,7 +8,8 @@ the old hardcoded route (`path.rs`).
 cargo run --release
 cargo run --release -- --walk-speed 0.9     # walking speed factor, 0.3..1.5 (default 0.5); escape unaffected
 cargo run --release -- --demo-path          # the old figure-eight route instead of the brain
-cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second; contact whiskers (cyan: geometry, magenta: vision)
+cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second, CPU % of one core at exit; contact whiskers (cyan: geometry, magenta: vision)
+cargo run --release -- --recordable         # visible to recorders/screen sharing (tray: Recordable); vision off while on
 cargo run --release -- --trace-map map.png [--minutes 3]  # run N min, then map path (blue..yellow by contact), edges, vision dots; exit
 cargo run --release -- --dump-vision <dir>   # 10 s live, once a second: <i>_raw/_cells/_edges.png + vision.txt, then exit
 cargo run --release -- --pack <file.fbp>    # load another brain pack instead of the embedded stub

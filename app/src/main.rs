@@ -16,7 +16,7 @@ use fly::{Feet, FlyPose};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, Pixmap};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -33,7 +33,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
     PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
-    SetWindowDisplayAffinity, ShowWindow, TranslateMessage, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, UpdateLayeredWindow, WM_DPICHANGED, WM_QUIT,
+    SetWindowDisplayAffinity, ShowWindow, TranslateMessage, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, UpdateLayeredWindow, WM_DPICHANGED, WM_QUIT,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -45,6 +45,75 @@ const FRAME: Duration = Duration::from_micros(16_667); // ~60 Hz
 /// notices and rebuilds the window-sized buffers. (A window procedure is a bare `extern fn`
 /// with no access to our locals, so a global flag is the simplest way to talk to the loop.)
 static DPI_CHANGED: AtomicBool = AtomicBool::new(false);
+/// Recordable (`--recordable`, tray): the overlay shows up in captures, so vision is off. Read by
+/// the `--debug` line.
+static RECORDABLE: AtomicBool = AtomicBool::new(false);
+
+/// This process's CPU time (all threads, kernel + user), s.
+fn process_cpu_s() -> f32 {
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut t = [Default::default(); 4];
+    // SAFETY: four FILETIME out-params, all locals; the pseudo-handle needs no closing.
+    let _ = unsafe { GetProcessTimes(GetCurrentProcess(), &mut t[0], &mut t[1], &mut t[2], &mut t[3]) };
+    let s = |f: windows::Win32::Foundation::FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 1e7;
+    (s(t[2]) + s(t[3])) as f32
+}
+
+/// `--debug`: process CPU time / wall time over the first `CpuMeter::SECS` of running (pauses
+/// skipped), as % of ONE core. Task Manager shows % of the whole machine.
+#[derive(Default)]
+struct CpuMeter {
+    /// (CPU s, wall s) so far, and the current running stretch's start.
+    acc: (f32, f32),
+    base: Option<(f32, Instant)>,
+}
+
+impl CpuMeter {
+    const SECS: f32 = 60.0;
+
+    fn start(&mut self) {
+        if self.acc.1 < Self::SECS && self.base.is_none() {
+            self.base = Some((process_cpu_s(), Instant::now()));
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some((c, t)) = self.base.take() {
+            self.acc = (self.acc.0 + process_cpu_s() - c, self.acc.1 + t.elapsed().as_secs_f32());
+        }
+    }
+
+    /// Stops once the window is full.
+    fn check(&mut self) {
+        if self.base.is_some_and(|(_, t)| self.acc.1 + t.elapsed().as_secs_f32() >= Self::SECS) {
+            self.stop();
+        }
+    }
+
+    fn report(&mut self) -> String {
+        self.stop();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let one = 100.0 * self.acc.0 / self.acc.1.max(1e-3);
+        format!("cpu: {one:.1}% of one core over {:.0} s running; {cores} logical cores = {:.2}% of the machine", self.acc.1, one / cores as f32)
+    }
+}
+
+/// Excluded from capture (the default: hidden from recorders and screen sharing, and vision can
+/// work) or recordable. Returns whether vision may run.
+fn set_recordable(hwnd: HWND, on: bool) -> bool {
+    RECORDABLE.store(on, Ordering::Relaxed);
+    // SAFETY: plain FFI call on our own live window.
+    match unsafe { SetWindowDisplayAffinity(hwnd, if on { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE }) } {
+        Ok(()) => !on,
+        Err(e) => {
+            // Refused exclusion: no fallback, a screen BitBlt shows layered windows with or
+            // without CAPTUREBLT (see `self_exclusion`), so the fly goes blind rather than
+            // follow its own outline.
+            eprintln!("flit: display affinity refused ({e}); vision off");
+            false
+        }
+    }
+}
 
 /// Every window needs a window procedure. We draw with `UpdateLayeredWindow`, so WM_PAINT never
 /// arrives; quitting comes from the tray. The only message we care about is WM_DPICHANGED.
@@ -288,11 +357,11 @@ impl Driver {
                         (*ms, *n, *prints) = (0, 0, *prints + 1);
                         if *prints % 2 == 0 {
                             println!(
-                                "  world: {} windows, {} segments, poll {:.2} ms, vision {:.2} ms, vis L {:.2} R {:.2}, contact L {:.2} R {:.2}, adapt L {:.2} R {:.2}",
+                                "  world: {} windows, {} segments, poll {:.2} ms, vision: {}, vis L {:.2} R {:.2}, contact L {:.2} R {:.2}, adapt L {:.2} R {:.2}",
                                 world.rects.len(),
                                 world.segs.len(),
                                 world.poll_ms,
-                                world.look.ms,
+                                if RECORDABLE.load(Ordering::Relaxed) { "off (recordable)".to_owned() } else { format!("{:.2} ms", world.look.ms) },
                                 body.vis.0,
                                 body.vis.1,
                                 body.contact.0,
@@ -377,7 +446,7 @@ fn main() {
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") || flag("--dump-vision") || flag("--trace-map") {
+    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") || flag("--dump-vision") || flag("--trace-map") || flag("--recordable") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -445,9 +514,11 @@ fn main() {
     // Tray icon first: it's our only way out. tray-icon makes its own hidden window on this
     // thread, so it works as long as our loop below keeps dispatching messages.
     let pause = MenuItem::new("Pause", true, None);
+    let recordable = CheckMenuItem::new("Recordable", true, flag("--recordable"), None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
     menu.append(&pause).unwrap();
+    menu.append(&recordable).unwrap();
     menu.append(&quit).unwrap();
     let icon = Icon::from_rgba([0x57, 0x46, 0x2c, 255].repeat(32 * 32), 32, 32).unwrap();
     let _tray = TrayIconBuilder::new() // dropped at end of main => icon removed, no ghost icon
@@ -458,17 +529,8 @@ fn main() {
         .unwrap();
 
     let hwnd = overlay();
-    // The fly must not see itself (`vision`). Without this there is no fallback: under DWM a
-    // screen BitBlt shows layered windows with or without CAPTUREBLT (see `self_exclusion`), so
-    // the fly goes blind rather than follow its own outline.
-    // SAFETY: plain FFI call on our own live window.
-    let sees = match unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("flit: WDA_EXCLUDEFROMCAPTURE refused ({e}); vision off");
-            false
-        }
-    };
+    // The fly must not see itself (`vision`): excluded from capture unless recordable.
+    let mut sees = set_recordable(hwnd, recordable.is_checked());
     // `--trace-map <png> [--minutes N]`: run N minutes (running time), then draw the map and exit.
     let trace_map = args.iter().position(|a| a == "--trace-map").map(|i| args.get(i + 1).cloned().unwrap_or_else(|| {
         eprintln!("flit: --trace-map needs a .png path");
@@ -524,6 +586,10 @@ fn main() {
     let mut next_poll = clock.last + POLL;
     let (started, mut dumped) = (clock.last, 0);
     let mut eye = sees.then(vision::Eye::new);
+    // After exclusion is restored, vision waits this long (the compositor takes a frame or so).
+    let mut see_from = clock.last;
+    let mut cpu = CpuMeter::default();
+    cpu.start();
     let mut msg = Default::default();
     'main: loop {
         // SAFETY: `msg` is a valid MSG out-param; PeekMessage (non-blocking) fills it.
@@ -546,6 +612,16 @@ fn main() {
                 let paused = !clock.paused;
                 clock.set_paused(paused, Instant::now());
                 pause.set_text(if paused { "Resume" } else { "Pause" });
+                if paused { cpu.stop() } else { cpu.start() }
+            }
+            if e.id == *recordable.id() {
+                // Vision off before the fly becomes capturable; excluded again before it's back on.
+                eye = None; // ends the thread; a look in flight is thrown away with it
+                if let Driver::Brain { world, .. } = &mut driver {
+                    world.look = Default::default();
+                }
+                sees = set_recordable(hwnd, recordable.is_checked());
+                see_from = Instant::now() + Duration::from_millis(500);
             }
         }
 
@@ -570,6 +646,10 @@ fn main() {
         let now = Instant::now();
         if now >= next_poll {
             if let Driver::Brain { world, body, .. } = &mut driver {
+                cpu.check();
+                if sees && eye.is_none() && now >= see_from {
+                    eye = Some(vision::Eye::new());
+                }
                 let look = std::mem::take(&mut world.look);
                 *world = world::poll(hwnd);
                 world.look = eye.as_mut().and_then(|e| e.poll(body.head(scale), scale)).unwrap_or(look);
@@ -626,6 +706,9 @@ fn main() {
         if redraw {
             canvas.present(hwnd, &pose, &feet, scale, driver.whiskers());
         }
+    }
+    if flag("--debug") {
+        println!("{}", cpu.report());
     }
     if let (Some(t), Some(path)) = (&trace, &trace_map) {
         println!("{}", t.legend());
@@ -734,6 +817,26 @@ mod tests {
     /// Channel order is the silent bug: red must stay red. tiny-skia RGBA [R,G,B,A] in,
     /// Windows BGRA out.
     #[test]
+    fn cpu_meter_skips_pauses() {
+        let burn = |ms| {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(ms) {
+                std::hint::black_box(0u64.wrapping_add(1));
+            }
+        };
+        let mut m = CpuMeter::default();
+        m.start();
+        burn(300);
+        m.stop();
+        std::thread::sleep(Duration::from_millis(300)); // paused: not counted
+        m.start();
+        burn(300);
+        let r = m.report();
+        // Other tests share the process, so CPU is only bounded below.
+        assert!((0.55..0.75).contains(&m.acc.1) && m.acc.0 > 0.4, "{r}");
+    }
+
+    #[test]
     fn red_stays_red() {
         // The eye's mid red, exactly as the palette gives it, plus a half-alpha pixel.
         let (r, g, b) = art::EYE[1];
@@ -752,7 +855,6 @@ mod tests {
     #[ignore]
     fn self_exclusion() {
         use windows::Win32::Graphics::Gdi::{CAPTUREBLT, SRCCOPY};
-        use windows::Win32::UI::WindowsAndMessaging::WDA_NONE;
         // SAFETY: plain FFI call; fails harmlessly if already set.
         let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let hwnd = overlay();
@@ -768,12 +870,12 @@ mod tests {
         // SAFETY: hwnd is our live window.
         let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
         let mut rows = vec![];
-        for (name, wda) in [("no affinity", WDA_NONE), ("WDA_EXCLUDEFROMCAPTURE", WDA_EXCLUDEFROMCAPTURE)] {
-            // SAFETY: as above.
-            let ok = unsafe { SetWindowDisplayAffinity(hwnd, wda) };
+        // Recordable, then excluded again: the tray toggle's path.
+        for (name, on) in [("recordable (WDA_NONE)", true), ("excluded (WDA_EXCLUDEFROMCAPTURE)", false)] {
+            let sees = set_recordable(hwnd, on);
             settle();
             let (plain, blt) = (changed(&before.0, &grab(SRCCOPY)), changed(&before.1, &grab(CAPTUREBLT | SRCCOPY)));
-            println!("{name} ({ok:?}): fly pixels in capture: SRCCOPY {plain}, CAPTUREBLT {blt} (of {})", size * size);
+            println!("{name}, vision {sees}: fly pixels in capture: SRCCOPY {plain}, CAPTUREBLT {blt} (of {})", size * size);
             rows.push((plain, blt));
         }
         // SAFETY: our window, destroyed once.

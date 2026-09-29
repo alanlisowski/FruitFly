@@ -1,0 +1,10 @@
+0 origin (0, 0) cell 0 px, 0 edge points, 0.00 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+1 origin (882, 329) cell 5 px, 0 edge points, 19.37 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+2 origin (965, 351) cell 5 px, 0 edge points, 17.96 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+3 origin (1032, 397) cell 5 px, 0 edge points, 15.96 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+4 origin (1106, 440) cell 5 px, 0 edge points, 9.06 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+5 origin (1189, 462) cell 5 px, 0 edge points, 7.90 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+6 origin (1260, 497) cell 5 px, 0 edge points, 8.26 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+7 origin (1342, 531) cell 5 px, 0 edge points, 6.67 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+8 origin (1423, 552) cell 5 px, 0 edge points, 18.58 ms, vis L 0.00 R 0.00, contact L 0.00 R 0.00
+9 origin (1500, 574) cell 5 px, 0 edge points, 16.50 ms, vis L 0.00 R 0.00, contact L 0.07 R 0.00
