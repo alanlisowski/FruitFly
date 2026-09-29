@@ -6,6 +6,7 @@ mod body;
 mod fly;
 mod path;
 mod snapshot;
+mod trace;
 mod vision;
 mod world;
 
@@ -97,8 +98,9 @@ struct Canvas {
     dc: HDC,
     bmp: HBITMAP,
     bits: *mut u8,
-    /// (window x, window y, heading, gait phase) of the frame on screen. Same again = nothing to do.
-    shown: Option<[f32; 4]>,
+    /// (window x, window y, heading, gait phase, whiskers) of the frame on screen. Same again =
+    /// nothing to do.
+    shown: Option<[f32; 8]>,
 }
 
 impl Canvas {
@@ -139,18 +141,25 @@ impl Canvas {
 
     /// Draws `pose` and pushes it to the screen, moving and (if needed) resizing the window.
     /// Skips both if the fly looks exactly as it did last time (e.g. while it stands still).
-    fn present(&mut self, hwnd: HWND, pose: &FlyPose, feet: &Feet, scale: f32) {
+    /// `whiskers`: `--debug`'s contact dots, (contact, vision won) per side.
+    fn present(&mut self, hwnd: HWND, pose: &FlyPose, feet: &Feet, scale: f32, whiskers: Option<[(f32, bool); 2]>) {
         // The window moves in whole art pixels and the fly is drawn at its centre: a fractional
         // offset inside the pixmap would make non-AA edges flicker (see `art`).
         let origin = art::window_origin(pose, scale, self.size);
         // Feet follow from these: they only move when the body moves or the gait advances.
-        let key = [origin.0 as f32, origin.1 as f32, pose.heading, pose.gait_phase];
+        let w = whiskers.unwrap_or_default();
+        let key = [origin.0 as f32, origin.1 as f32, pose.heading, pose.gait_phase, w[0].0, w[1].0, w[0].1 as u8 as f32, w[1].1 as u8 as f32];
         if self.shown == Some(key) {
             return;
         }
         self.shown = Some(key);
         self.pixmap.fill(Color::TRANSPARENT);
         art::draw(pose, feet, scale, &mut self.pixmap);
+        if let Some(w) = whiskers {
+            // Cyan: geometry won that side; magenta: vision did. Neither is in the fly's palette.
+            let tint = |(c, vision): (f32, bool)| (c, if vision { [255, 0, 255] } else { [0, 255, 255] });
+            art::whiskers(pose.heading, scale, w.map(tint), &mut self.pixmap);
+        }
 
         // SAFETY: `bits` points to size*size*4 bytes (see `new`), and `&mut self` means nothing
         // else is touching them. Every pointer handed to UpdateLayeredWindow refers to a local
@@ -299,6 +308,14 @@ impl Driver {
         }
     }
 
+    /// `--debug` whiskers: adapted contact per side, and whether vision beat geometry there.
+    fn whiskers(&self) -> Option<[(f32, bool); 2]> {
+        match self {
+            Driver::Brain { body: b, debug: Some(_), .. } => Some([(b.contact.0, b.vis.0 > b.geo.0), (b.contact.1, b.vis.1 > b.geo.1)]),
+            _ => None,
+        }
+    }
+
     fn pose(&self, scale: f32) -> FlyPose {
         match self {
             Driver::Brain { body, .. } => body.pose(scale),
@@ -360,7 +377,7 @@ fn main() {
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") || flag("--dump-vision") {
+    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") || flag("--dump-vision") || flag("--trace-map") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -452,6 +469,22 @@ fn main() {
             false
         }
     };
+    // `--trace-map <png> [--minutes N]`: run N minutes (running time), then draw the map and exit.
+    let trace_map = args.iter().position(|a| a == "--trace-map").map(|i| args.get(i + 1).cloned().unwrap_or_else(|| {
+        eprintln!("flit: --trace-map needs a .png path");
+        std::process::exit(1);
+    }));
+    let minutes = match args.iter().position(|a| a == "--minutes") {
+        None => 3.0,
+        Some(i) => match args.get(i + 1).and_then(|v| v.parse::<f32>().ok()) {
+            Some(v) if v > 0.0 => v,
+            _ => {
+                eprintln!("flit: --minutes needs a positive number");
+                std::process::exit(1);
+            }
+        },
+    };
+    let mut trace = trace_map.is_some().then(trace::Trace::default);
     let dump_vision = args.iter().position(|a| a == "--dump-vision").map(|i| {
         let dir = std::path::PathBuf::from(args.get(i + 1).map(String::as_str).unwrap_or("."));
         let _ = std::fs::create_dir_all(&dir);
@@ -475,7 +508,7 @@ fn main() {
     };
     let mut pose = driver.pose(scale);
     let mut feet = Feet::new(&pose, scale);
-    canvas.present(hwnd, &pose, &feet, scale);
+    canvas.present(hwnd, &pose, &feet, scale, driver.whiskers());
     // SW_SHOWNOACTIVATE: show without activating. Plain SW_SHOW would steal focus.
     // SAFETY: hwnd is a live window we created.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
@@ -540,6 +573,12 @@ fn main() {
                 let look = std::mem::take(&mut world.look);
                 *world = world::poll(hwnd);
                 world.look = eye.as_mut().and_then(|e| e.poll(body.head(scale), scale)).unwrap_or(look);
+                if let Some(t) = &mut trace {
+                    t.poll(world);
+                    if t.secs() >= minutes * 60.0 {
+                        break 'main;
+                    }
+                }
                 if let Some(dir) = &dump_vision {
                     // Once a second for 10 s, then exit.
                     let secs = now.duration_since(started).as_secs() as u32;
@@ -569,7 +608,11 @@ fn main() {
         if now >= next_frame {
             // Motion is driven by real elapsed running time, not by counting frames, so a
             // dropped frame doesn't change the fly's speed (see `Clock`).
-            driver.advance(clock.tick(now), scale);
+            let dt = clock.tick(now);
+            driver.advance(dt, scale);
+            if let (Some(t), Driver::Brain { body: b, .. }) = (&mut trace, &driver) {
+                t.frame(b.x, b.y, b.geo.0.max(b.vis.0).max(b.geo.1.max(b.vis.1)), dt);
+            }
             pose = driver.pose(scale);
             feet.update(&pose, scale);
             redraw = true;
@@ -581,7 +624,13 @@ fn main() {
             std::thread::sleep(next_frame - now);
         }
         if redraw {
-            canvas.present(hwnd, &pose, &feet, scale);
+            canvas.present(hwnd, &pose, &feet, scale, driver.whiskers());
+        }
+    }
+    if let (Some(t), Some(path)) = (&trace, &trace_map) {
+        println!("{}", t.legend());
+        if let Err(e) = t.draw().and_then(|pm| pm.save_png(path).map_err(|e| e.to_string())) {
+            eprintln!("flit: {e}");
         }
     }
     // SAFETY: hwnd is ours and still valid. Then `_tray` drops, removing the tray icon.
@@ -710,7 +759,7 @@ mod tests {
         let scale = dpi_scale(hwnd);
         let mut canvas = Canvas::new(scale);
         let pose = Body::new(screen_center()).pose(scale);
-        canvas.present(hwnd, &pose, &Feet::new(&pose, scale), scale);
+        canvas.present(hwnd, &pose, &Feet::new(&pose, scale), scale, None);
         let (origin, size) = (art::window_origin(&pose, scale, canvas.size), canvas.size as usize);
         let settle = || std::thread::sleep(Duration::from_millis(400));
         let grab = |rop| vision::capture(origin, size, rop).expect("capture");

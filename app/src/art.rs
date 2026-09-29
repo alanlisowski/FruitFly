@@ -324,6 +324,25 @@ pub fn draw(pose: &FlyPose, feet: &Feet, scale: f32, out: &mut Pixmap) {
     upscale(&art, ap, out);
 }
 
+/// Whisker dots, body units: just ahead of the head (~11), beside the antennae (~20), inside
+/// `fly::RADIUS` at full size.
+const WHISKER: (f32, f32) = (22.0, 6.0);
+/// `--debug`: a dot each side of the head, (left, right) = (contact 0..1, colour). Radius and
+/// alpha follow contact; nothing at 0. Drawn on the window pixmap, centred like `draw`.
+pub fn whiskers(heading: f32, scale: f32, w: [(f32, [u8; 3]); 2], out: &mut Pixmap) {
+    let k = FLY_SCALE * scale;
+    let body = Transform::from_translate(out.width() as f32 / 2.0, out.height() as f32 / 2.0).pre_rotate(heading.to_degrees()).pre_scale(k, k);
+    for ((c, [r, g, b]), side) in w.into_iter().zip([-1.0, 1.0]) {
+        if c < 0.02 {
+            continue;
+        }
+        let mut paint = Paint::default();
+        paint.anti_alias = false;
+        paint.set_color_rgba8(r, g, b, (c.min(1.0) * 255.0) as u8);
+        out.fill_path(&circle(WHISKER.0, side * WHISKER.1, 0.8 + 1.2 * c.min(1.0)), &paint, FillRule::Winding, body, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +361,7 @@ mod tests {
                 walk(scale, radius, 240, |pose, feet| {
                     pm.fill(Color::TRANSPARENT);
                     draw(pose, feet, scale, &mut pm);
+                    whiskers(pose.heading, scale, [(1.0, [0, 255, 255]), (1.0, [255, 0, 255])], &mut pm);
                     let a = |i: usize| pm.data()[i * 4 + 3] != 0;
                     for i in 0..n {
                         assert!(!a(i) && !a((n - 1) * n + i), "top/bottom edge hit at {scale}");

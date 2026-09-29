@@ -8,7 +8,8 @@ the old hardcoded route (`path.rs`).
 cargo run --release
 cargo run --release -- --walk-speed 0.9     # walking speed factor, 0.3..1.5 (default 0.5); escape unaffected
 cargo run --release -- --demo-path          # the old figure-eight route instead of the brain
-cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second
+cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second; contact whiskers (cyan: geometry, magenta: vision)
+cargo run --release -- --trace-map map.png [--minutes 3]  # run N min, then map path (blue..yellow by contact), edges, vision dots; exit
 cargo run --release -- --dump-vision <dir>   # 10 s live, once a second: <i>_raw/_cells/_edges.png + vision.txt, then exit
 cargo run --release -- --pack <file.fbp>    # load another brain pack instead of the embedded stub
 cargo test                              # gait, no-skating, no-clipping, colour, snapshot checks
@@ -26,6 +27,7 @@ Tray menu: **Pause** / **Resume** (stops all work), **Quit**.
 | `path.rs` | Stand-in for the brain: figure-eight, varying speed, one stop per lap. |
 | `snapshot.rs` | `--snapshot`: re-renders the four `pixel_*` reference images for side-by-side comparison. |
 | `vision.rs` | The fly's eyes: a screen patch around the head (GDI BitBlt, on its own thread), 4-logical-px luminance cells, tone-step edges -> points `world::seen` feels like window edges. |
+| `trace.rs` | `--trace-map`: records path, contact, segments and vision points, draws the 1/2-scale map. |
 | `main.rs` | Window, DIB blit, DPI handling, tray, main loop. |
 | `../reference/` | The spec: `fly_pixel.py` plus the `pixel_*.png` targets. `old_green/` keeps the previous cartoon spec. Not built or shipped. |
 

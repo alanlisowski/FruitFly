@@ -54,7 +54,9 @@ pub struct Body {
     pub sense_ahead: f32,
     /// Last frame's contact (left, right), 0..1, after adaptation, for `--debug`.
     pub contact: (f32, f32),
-    /// Last frame's visual contact (left, right), before max-ing with geometry, for `--debug`.
+    /// Last frame's geometric and visual contact (left, right), before max-ing and adaptation,
+    /// for `--debug` (whiskers are tinted by which one won).
+    pub geo: (f32, f32),
     pub vis: (f32, f32),
     pub adapt: world::Adapt,
     /// How long the fly has been pressing into the wall while sliding along it, the (random)
@@ -73,7 +75,7 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), vis: (0.0, 0.0), adapt: world::Adapt::new(), press_ms: 0.0, press_limit: 2500.0, course_turn: 0.0, pen: (0.0, 0.0), rng: 0x9E37_79B9_7F4A_7C15, stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), geo: (0.0, 0.0), vis: (0.0, 0.0), adapt: world::Adapt::new(), press_ms: 0.0, press_limit: 2500.0, course_turn: 0.0, pen: (0.0, 0.0), rng: 0x9E37_79B9_7F4A_7C15, stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
     /// xorshift64*: uniform in [a, b).
@@ -105,9 +107,9 @@ impl Body {
         home: impl Fn(f32, f32) -> (f32, f32),
     ) -> usize {
         let (head, reach) = (self.head(scale), world::REACH * FLY_SCALE * scale);
-        let geo = world::contact((self.x, self.y), head, self.heading, reach, segs);
+        self.geo = world::contact((self.x, self.y), head, self.heading, reach, segs);
         self.vis = world::seen((self.x, self.y), head, self.heading, reach, seen);
-        let raw = (geo.0.max(self.vis.0), geo.1.max(self.vis.1));
+        let raw = (self.geo.0.max(self.vis.0), self.geo.1.max(self.vis.1));
         self.contact = self.adapt.step(raw, steps as f32);
         let left = brain.pack.sensory("CONTACT_left").to_vec();
         let right = brain.pack.sensory("CONTACT_right").to_vec();
