@@ -170,22 +170,46 @@ fn falloff(d: f32, reach: f32) -> f32 {
 /// edge on its left the fly turns left (CONTACT -> ipsilateral DNa02); crossing puts it on the
 /// right, and the fly turns back: it ends up running along the line.
 pub fn contact(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, segs: &[Seg]) -> (f32, f32) {
-    let (hx, hy) = (heading.cos(), heading.sin());
     let (mut l, mut r) = (0.0_f32, 0.0_f32);
     for s in segs {
-        let p = nearest(s, head);
-        let d = (p.0 - head.0).hypot(p.1 - head.1);
-        let (dx, dy) = (p.0 - thorax.0, p.1 - thorax.1);
-        let b = dx.hypot(dy);
-        if d >= reach || b < 1e-6 {
-            continue;
+        if let Some((_, pl, pr)) = feel(thorax, head, heading, reach, nearest(s, head)) {
+            (l, r) = (l + pl, r + pr);
         }
-        let (cos, sin) = ((hx * dx + hy * dy) / b, (hx * dy - hy * dx) / b); // y down: sin > 0 = right
-        let w = falloff(d, reach) * (1.0 + cos).min(1.0);
-        l += w * (-sin).max(0.0);
-        r += w * sin.max(0.0);
     }
     (l.min(1.0), r.min(1.0))
+}
+
+/// One felt point `p`: (distance from the head, left, right), or None beyond reach.
+fn feel(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, p: (f32, f32)) -> Option<(f32, f32, f32)> {
+    let (hx, hy) = (heading.cos(), heading.sin());
+    let d = (p.0 - head.0).hypot(p.1 - head.1);
+    let (dx, dy) = (p.0 - thorax.0, p.1 - thorax.1);
+    let b = dx.hypot(dy);
+    if d >= reach || b < 1e-6 {
+        return None;
+    }
+    let (cos, sin) = ((hx * dx + hy * dy) / b, (hx * dy - hy * dx) / b); // y down: sin > 0 = right
+    let w = falloff(d, reach) * (1.0 + cos).min(1.0);
+    Some((d, w * (-sin).max(0.0), w * sin.max(0.0)))
+}
+
+/// `contact` for seen edge points (`vision`): per side, the point on that side nearest the
+/// head, weighted as a segment's nearest point is. A seen straight edge is a row of points, so
+/// this matches the segment it stands for.
+// ponytail: one edge per side; two seen edges on one side don't add up like segments do
+pub fn seen(thorax: (f32, f32), head: (f32, f32), heading: f32, reach: f32, pts: &[(f32, f32)]) -> (f32, f32) {
+    let (mut l, mut r) = ((f32::MAX, 0.0), (f32::MAX, 0.0));
+    for &p in pts {
+        if let Some((d, pl, pr)) = feel(thorax, head, heading, reach, p) {
+            if pl > 0.0 && d < l.0 {
+                l = (d, pl);
+            }
+            if pr > 0.0 && d < r.0 {
+                r = (d, pr);
+            }
+        }
+    }
+    (l.1.min(1.0), r.1.min(1.0))
 }
 
 /// Mechanosensory adaptation, per side: under contact a receptor's gain sinks toward
@@ -230,6 +254,8 @@ pub struct World {
     /// What the fly can feel: visible window edges plus the work-area border.
     pub segs: Vec<Seg>,
     pub poll_ms: f32,
+    /// What the fly saw around its head (`vision`), polled alongside.
+    pub look: crate::vision::Look,
 }
 
 /// EnumWindows callback: collect only. No filtering and nothing that can panic, because a
@@ -310,7 +336,7 @@ pub fn poll(own: HWND) -> World {
     let (hwnds, rects): (Vec<HWND>, Vec<Rect>) = hwnds.into_iter().filter_map(|h| Some((h, frame_of(h, own)?))).unzip();
     let work = work_areas();
     let segs = feelable(&rects, &work);
-    World { rects, hwnds, work, segs, poll_ms: t.elapsed().as_secs_f32() * 1000.0 }
+    World { rects, hwnds, work, segs, poll_ms: t.elapsed().as_secs_f32() * 1000.0, ..Default::default() }
 }
 
 /// "class: title", for `--dump-world`'s listing.

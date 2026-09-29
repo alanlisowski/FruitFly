@@ -54,6 +54,8 @@ pub struct Body {
     pub sense_ahead: f32,
     /// Last frame's contact (left, right), 0..1, after adaptation, for `--debug`.
     pub contact: (f32, f32),
+    /// Last frame's visual contact (left, right), before max-ing with geometry, for `--debug`.
+    pub vis: (f32, f32),
     pub adapt: world::Adapt,
     /// How long the fly has been pressing into the wall while sliding along it, the (random)
     /// limit, and what's left of a course change, in radians (signed).
@@ -71,7 +73,7 @@ pub struct Body {
 
 impl Body {
     pub fn new((x, y): (f32, f32)) -> Body {
-        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), adapt: world::Adapt::new(), press_ms: 0.0, press_limit: 2500.0, course_turn: 0.0, pen: (0.0, 0.0), rng: 0x9E37_79B9_7F4A_7C15, stuck_ms: 0.0, unstick_ms: 0.0 }
+        Body { x, y, heading: 0.0, omega: 0.0, speed: 0.0, escape_latch: 0.0, walked: 0.0, walk: WALK_SPEED, sense_ahead: SENSE_AHEAD, contact: (0.0, 0.0), vis: (0.0, 0.0), adapt: world::Adapt::new(), press_ms: 0.0, press_limit: 2500.0, course_turn: 0.0, pen: (0.0, 0.0), rng: 0x9E37_79B9_7F4A_7C15, stuck_ms: 0.0, unstick_ms: 0.0 }
     }
 
     /// xorshift64*: uniform in [a, b).
@@ -83,7 +85,14 @@ impl Body {
         a + (b - a) * u
     }
 
-    /// One frame: feel `segs` (through adaptation), hold that contact for all `steps` brain steps
+    /// The sensing point, screen px.
+    pub fn head(&self, scale: f32) -> (f32, f32) {
+        let a = self.sense_ahead * FLY_SCALE * scale;
+        (self.x + self.heading.cos() * a, self.y + self.heading.sin() * a)
+    }
+
+    /// One frame: feel `segs` and see `seen` (edge points from `vision`; per side the stronger of
+    /// the two, through adaptation), hold that contact for all `steps` brain steps
     /// (injected into the CONTACT neurons like looming is), then move. Returns the spike count.
     pub fn tick(
         &mut self,
@@ -91,13 +100,14 @@ impl Body {
         steps: u32,
         scale: f32,
         segs: &[Seg],
+        seen: &[(f32, f32)],
         inside: impl Fn(f32, f32) -> bool,
         home: impl Fn(f32, f32) -> (f32, f32),
     ) -> usize {
-        let unit = FLY_SCALE * scale;
-        let a = self.sense_ahead * unit;
-        let head = (self.x + self.heading.cos() * a, self.y + self.heading.sin() * a);
-        let raw = world::contact((self.x, self.y), head, self.heading, world::REACH * unit, segs);
+        let (head, reach) = (self.head(scale), world::REACH * FLY_SCALE * scale);
+        let geo = world::contact((self.x, self.y), head, self.heading, reach, segs);
+        self.vis = world::seen((self.x, self.y), head, self.heading, reach, seen);
+        let raw = (geo.0.max(self.vis.0), geo.1.max(self.vis.1));
         self.contact = self.adapt.step(raw, steps as f32);
         let left = brain.pack.sensory("CONTACT_left").to_vec();
         let right = brain.pack.sensory("CONTACT_right").to_vec();
@@ -309,7 +319,7 @@ mod tests {
         let home = |_: f32, _: f32| ((work.l + work.r) / 2.0, (work.t + work.b) / 2.0);
         let mut fastest = 0.0_f32;
         for _ in 0..(secs * 60.0) as u32 {
-            body.tick(&mut brain, 16, 1.0, segs, inside, home);
+            body.tick(&mut brain, 16, 1.0, segs, &[], inside, home);
             fastest = fastest.max(body.omega.abs() * 1000.0 * 180.0 / PI);
             if fastest > SPIN_DEG_S {
                 return (false, fastest);
@@ -466,7 +476,7 @@ mod tests {
             let (mut near_border, mut visited, mut run, mut longest) = (0u32, [false; 3], (None, 0u32), 0u32);
             let frames = 60 * 300;
             for _ in 0..frames {
-                body.tick(&mut brain, 16, 1.0, &segs, inside, |_, _| (960.0, 510.0));
+                body.tick(&mut brain, 16, 1.0, &segs, &[], inside, |_, _| (960.0, 510.0));
                 let p = (body.x, body.y);
                 near_border += (distance(p, &border_segs) < BL) as u32;
                 for (w, v) in visited.iter_mut().enumerate() {

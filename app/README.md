@@ -9,6 +9,7 @@ cargo run --release
 cargo run --release -- --walk-speed 0.9     # walking speed factor, 0.3..1.5 (default 0.5); escape unaffected
 cargo run --release -- --demo-path          # the old figure-eight route instead of the brain
 cargo run --release -- --debug              # print turn/forward commands, bump and spikes/s twice a second
+cargo run --release -- --dump-vision <dir>   # 10 s live, once a second: <i>_raw/_cells/_edges.png + vision.txt, then exit
 cargo run --release -- --pack <file.fbp>    # load another brain pack instead of the embedded stub
 cargo test                              # gait, no-skating, no-clipping, colour, snapshot checks
 cargo run --release -- --snapshot out   # writes pixel_closeup / _turning / _walking / _actual_size .png, no window
@@ -24,6 +25,7 @@ Tray menu: **Pause** / **Resume** (stops all work), **Quit**.
 | `fly.rs` | `FlyPose` and the gait: where each of the six `Feet` stands. No Win32. |
 | `path.rs` | Stand-in for the brain: figure-eight, varying speed, one stop per lap. |
 | `snapshot.rs` | `--snapshot`: re-renders the four `pixel_*` reference images for side-by-side comparison. |
+| `vision.rs` | The fly's eyes: a screen patch around the head (GDI BitBlt, on its own thread), 4-logical-px luminance cells, tone-step edges -> points `world::seen` feels like window edges. |
 | `main.rs` | Window, DIB blit, DPI handling, tray, main loop. |
 | `../reference/` | The spec: `fly_pixel.py` plus the `pixel_*.png` targets. `old_green/` keeps the previous cartoon spec. Not built or shipped. |
 
@@ -108,3 +110,9 @@ until the next frame is due.
 Per frame on the route (`cargo test --release draw_cost -- --ignored --nocapture`): 100%
 0.30 ms, 125% 0.33 ms, 200% 0.34 ms. In the app at 125%: ~5.5% of one core walking (brain
 driving), ~0% standing still.
+
+Vision (`cargo test --release vision_cost -- --ignored --nocapture`, 125%, 360 x 360 px patch):
+BitBlt blocks ~15 ms waiting on the compositor but costs ~0.8 ms CPU, processing ~0.8 ms; at
+10 Hz that's ~1.7% of a core, on the vision thread. The overlay is kept out of the capture by
+`WDA_EXCLUDEFROMCAPTURE` (`cargo test self_exclusion -- --ignored --nocapture`, shows the fly
+~1 s); without it BitBlt sees the fly with or without CAPTUREBLT, so vision is switched off.

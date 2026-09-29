@@ -6,6 +6,7 @@ mod body;
 mod fly;
 mod path;
 mod snapshot;
+mod vision;
 mod world;
 
 use body::Body;
@@ -31,7 +32,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
     PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE,
-    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DPICHANGED, WM_QUIT,
+    SetWindowDisplayAffinity, ShowWindow, TranslateMessage, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, UpdateLayeredWindow, WM_DPICHANGED, WM_QUIT,
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -259,7 +260,7 @@ impl Driver {
                 *owed_ms += dt * 1000.0;
                 let steps = (*owed_ms as u32).min(Self::MAX_STEPS);
                 *owed_ms = (*owed_ms - steps as f32).min(0.999);
-                let spikes = body.tick(brain, steps, scale, &world.segs, on_work_area, work_area_centre);
+                let spikes = body.tick(brain, steps, scale, &world.segs, &world.look.pts, on_work_area, work_area_centre);
                 if let Some((ms, n, prints)) = debug {
                     (*ms, *n) = (*ms + steps, *n + spikes);
                     if *ms >= 500 {
@@ -278,10 +279,13 @@ impl Driver {
                         (*ms, *n, *prints) = (0, 0, *prints + 1);
                         if *prints % 2 == 0 {
                             println!(
-                                "  world: {} windows, {} segments, poll {:.2} ms, contact L {:.2} R {:.2}, adapt L {:.2} R {:.2}",
+                                "  world: {} windows, {} segments, poll {:.2} ms, vision {:.2} ms, vis L {:.2} R {:.2}, contact L {:.2} R {:.2}, adapt L {:.2} R {:.2}",
                                 world.rects.len(),
                                 world.segs.len(),
                                 world.poll_ms,
+                                world.look.ms,
+                                body.vis.0,
+                                body.vis.1,
                                 body.contact.0,
                                 body.contact.1,
                                 body.adapt.gain.0,
@@ -315,12 +319,48 @@ fn to_pose(s: &path::Step, scale: f32, center: (f32, f32)) -> FlyPose {
     }
 }
 
+/// The overlay: a click-through, topmost, layered popup, not yet shown.
+fn overlay() -> HWND {
+    // SAFETY: every call below is Win32 FFI. Handles come from the calls that create them and
+    // are used only on this thread, while still alive.
+    unsafe {
+        let hinstance = GetModuleHandleW(None).unwrap().into();
+        let class = w!("flit");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance,
+            lpszClassName: class,
+            ..Default::default()
+        });
+        CreateWindowExW(
+            // Extended styles, one job each:
+            WS_EX_LAYERED       // per-pixel alpha via UpdateLayeredWindow (soft edges, any shape)
+            | WS_EX_TRANSPARENT // mouse hit-testing skips us: clicks fall through to the window below
+            | WS_EX_TOPMOST     // sits above normal windows
+            | WS_EX_NOACTIVATE  // clicking/showing us never takes keyboard focus
+            | WS_EX_TOOLWINDOW, // hidden from Alt-Tab and the taskbar
+            class,
+            w!("flit"),
+            WS_POPUP, // no title bar, border or menu: the window is exactly our pixels
+            0,
+            0,
+            1,
+            1, // real size is set by UpdateLayeredWindow once we know the DPI
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+        .unwrap()
+    }
+}
+
 fn main() {
     // `flit --snapshot <dir>`: render the reference images and exit, no window. A windows-
     // subsystem exe has no console of its own, so borrow the parent's to be able to print.
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") {
+    if flag("--debug") || flag("--pack") || flag("--walk-speed") || flag("--dump-world") || flag("--dump-vision") {
         // SAFETY: plain FFI call; failing just means there is no parent console to print to.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -400,38 +440,23 @@ fn main() {
         .build()
         .unwrap();
 
-    // SAFETY: every call below is Win32 FFI. Handles come from the calls that create them and
-    // are used only on this thread, while still alive.
-    let hwnd = unsafe {
-        let hinstance = GetModuleHandleW(None).unwrap().into();
-        let class = w!("flit");
-        RegisterClassW(&WNDCLASSW {
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: class,
-            ..Default::default()
-        });
-        CreateWindowExW(
-            // Extended styles, one job each:
-            WS_EX_LAYERED       // per-pixel alpha via UpdateLayeredWindow (soft edges, any shape)
-            | WS_EX_TRANSPARENT // mouse hit-testing skips us: clicks fall through to the window below
-            | WS_EX_TOPMOST     // sits above normal windows
-            | WS_EX_NOACTIVATE  // clicking/showing us never takes keyboard focus
-            | WS_EX_TOOLWINDOW, // hidden from Alt-Tab and the taskbar
-            class,
-            w!("flit"),
-            WS_POPUP, // no title bar, border or menu: the window is exactly our pixels
-            0,
-            0,
-            1,
-            1, // real size is set by UpdateLayeredWindow once we know the DPI
-            None,
-            None,
-            Some(hinstance),
-            None,
-        )
-        .unwrap()
+    let hwnd = overlay();
+    // The fly must not see itself (`vision`). Without this there is no fallback: under DWM a
+    // screen BitBlt shows layered windows with or without CAPTUREBLT (see `self_exclusion`), so
+    // the fly goes blind rather than follow its own outline.
+    // SAFETY: plain FFI call on our own live window.
+    let sees = match unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("flit: WDA_EXCLUDEFROMCAPTURE refused ({e}); vision off");
+            false
+        }
     };
+    let dump_vision = args.iter().position(|a| a == "--dump-vision").map(|i| {
+        let dir = std::path::PathBuf::from(args.get(i + 1).map(String::as_str).unwrap_or("."));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    });
 
     let mut scale = dpi_scale(hwnd);
     let mut canvas = Canvas::new(scale);
@@ -464,6 +489,8 @@ fn main() {
     // The desktop is polled at 10 Hz, not every frame: windows move slowly next to a fly.
     const POLL: Duration = Duration::from_millis(100);
     let mut next_poll = clock.last + POLL;
+    let (started, mut dumped) = (clock.last, 0);
+    let mut eye = sees.then(vision::Eye::new);
     let mut msg = Default::default();
     'main: loop {
         // SAFETY: `msg` is a valid MSG out-param; PeekMessage (non-blocking) fills it.
@@ -509,8 +536,33 @@ fn main() {
 
         let now = Instant::now();
         if now >= next_poll {
-            if let Driver::Brain { world, .. } = &mut driver {
+            if let Driver::Brain { world, body, .. } = &mut driver {
+                let look = std::mem::take(&mut world.look);
                 *world = world::poll(hwnd);
+                world.look = eye.as_mut().and_then(|e| e.poll(body.head(scale), scale)).unwrap_or(look);
+                if let Some(dir) = &dump_vision {
+                    // Once a second for 10 s, then exit.
+                    let secs = now.duration_since(started).as_secs() as u32;
+                    if secs >= 10 {
+                        break 'main;
+                    }
+                    if secs >= dumped {
+                        dumped = secs + 1;
+                        let line = format!(
+                            "{secs} origin {:?} cell {} px, {} edge points, {:.2} ms, vis L {:.2} R {:.2}, contact L {:.2} R {:.2}
+",
+                            world.look.origin, world.look.cell, world.look.pts.len(), world.look.ms, body.vis.0, body.vis.1, body.contact.0, body.contact.1
+                        );
+                        print!("{line}");
+                        let text = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("vision.txt"));
+                        if let Err(e) = text.and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes())) {
+                            eprintln!("flit: {e}");
+                        }
+                        if let Err(e) = vision::dump(&world.look, dir, secs) {
+                            eprintln!("flit: {e}");
+                        }
+                    }
+                }
             }
             next_poll = now + POLL;
         }
@@ -641,5 +693,43 @@ mod tests {
         let mut out = [0u8; 8];
         rgba_to_bgra(&[199, 26, 48, 255, 100, 0, 0, 128], &mut out);
         assert_eq!(out, [48, 26, 199, 255, 0, 0, 100, 128]);
+    }
+
+    /// On the real desktop: shows the fly for ~2 s at the primary screen's centre and captures
+    /// under it, with and without WDA_EXCLUDEFROMCAPTURE, with SRCCOPY (what `vision` uses) and
+    /// CAPTUREBLT, each against a capture from before it appeared. The fly must be invisible to
+    /// what `vision` does. Run: `cargo test self_exclusion -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn self_exclusion() {
+        use windows::Win32::Graphics::Gdi::{CAPTUREBLT, SRCCOPY};
+        use windows::Win32::UI::WindowsAndMessaging::WDA_NONE;
+        // SAFETY: plain FFI call; fails harmlessly if already set.
+        let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let hwnd = overlay();
+        let scale = dpi_scale(hwnd);
+        let mut canvas = Canvas::new(scale);
+        let pose = Body::new(screen_center()).pose(scale);
+        canvas.present(hwnd, &pose, &Feet::new(&pose, scale), scale);
+        let (origin, size) = (art::window_origin(&pose, scale, canvas.size), canvas.size as usize);
+        let settle = || std::thread::sleep(Duration::from_millis(400));
+        let grab = |rop| vision::capture(origin, size, rop).expect("capture");
+        let changed = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| p[..3] != q[..3]).count();
+        let before = (grab(SRCCOPY), grab(CAPTUREBLT | SRCCOPY));
+        // SAFETY: hwnd is our live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+        let mut rows = vec![];
+        for (name, wda) in [("no affinity", WDA_NONE), ("WDA_EXCLUDEFROMCAPTURE", WDA_EXCLUDEFROMCAPTURE)] {
+            // SAFETY: as above.
+            let ok = unsafe { SetWindowDisplayAffinity(hwnd, wda) };
+            settle();
+            let (plain, blt) = (changed(&before.0, &grab(SRCCOPY)), changed(&before.1, &grab(CAPTUREBLT | SRCCOPY)));
+            println!("{name} ({ok:?}): fly pixels in capture: SRCCOPY {plain}, CAPTUREBLT {blt} (of {})", size * size);
+            rows.push((plain, blt));
+        }
+        // SAFETY: our window, destroyed once.
+        let _ = unsafe { DestroyWindow(hwnd) };
+        assert!(rows[0].0 + rows[0].1 > 100, "the fly never showed up in any capture: the test proves nothing");
+        assert_eq!(rows[1].0, 0, "vision sees the fly");
     }
 }
